@@ -1,0 +1,19 @@
+Core static data:
+https://fantasy.premierleague.com/api/bootstrap-static/
+
+Fixtures:
+https://fantasy.premierleague.com/api/fixtures/
+
+Player detailed stats:
+https://fantasy.premierleague.com/api/element-summary/{player_id}/
+
+Live gameweek data:
+https://fantasy.premierleague.com/api/event/{gameweek_id}/live/
+
+Manager Data:
+https://fantasy.premierleague.com/api/entry/{manager_id}/
+https://fantasy.premierleague.com/api/entry/{manager_id}/event/{gameweek_id}/picks/
+https://fantasy.premierleague.com/api/entry/{manager_id}/history/
+
+League standings:
+https://fantasy.premierleague.com/api/leagues-classic/{league_id}/standings/
