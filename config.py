@@ -24,6 +24,11 @@ STATIC_ENDPOINTS = {
         "description": "Match fixtures and results",
         "table": "raw_fixtures",
     },
+    "overall_league": {
+        "url": f"{FPL_BASE_URL}/leagues-classic/314/standings/",
+        "description": "Official FPL overall league standings",
+        "table": "raw_overall_league",
+    },
 }
 
 # Dynamic endpoints (require parameters)
@@ -41,13 +46,6 @@ DYNAMIC_ENDPOINTS = {
         "table": "raw_live_gameweek",
         "params": ["gameweek_id"],
         "id_source": "bootstrap_static",  # Get current gameweek from here
-    },
-    "league_standings": {
-        "url_template": f"{FPL_BASE_URL}/leagues-classic/{{league_id}}/standings/",
-        "description": "League standings",
-        "table": "raw_league_standings",
-        "params": ["league_id"],
-        "id_source": "manual", # IDs for league tracking
     },
 }
 
@@ -72,18 +70,13 @@ def get_snowflake_config() -> Optional[Dict[str, str]]:
     # Check if all required variables are present
     missing = [k for k, v in config.items() if v is None]
     if missing:
-        print(f"  Warning: Missing Snowflake config: {', '.join([m.upper() for m in missing])}")
-        print("   Pipeline will continue without Snowflake loading.")
+        print(f"WARNING: Missing Snowflake config: {', '.join([m.upper() for m in missing])}")
+        print("Pipeline will continue without Snowflake loading.")
         return None
     
     return config
 
 # Pipeline Settings
-RATE_LIMIT_DELAY = 0.5
+RATE_LIMIT_DELAY = 0.5  # Seconds between API calls
 MAX_RETRIES = 3
-RETRY_DELAY = 5 
-
-# IDs for league tracking
-TRACKED_LEAGUE_IDS = [
-    314, # Official FPL League
-]
+RETRY_DELAY = 5  # Seconds
