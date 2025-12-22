@@ -3,7 +3,7 @@ Snowflake connection and utility functions.
 """
 import snowflake.connector
 from snowflake.connector import DictCursor
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from contextlib import contextmanager
 import sys
 import os
@@ -156,3 +156,84 @@ def test_connection() -> bool:
         print(f"Snowflake connection failed: {e}")
         return False
 
+def create_typed_table(
+    table_name: str,
+    schema: Dict[str, str],
+    connection: Optional[snowflake.connector.connection] = None
+) -> bool:
+    """
+    Create a typed table in Snowflake from schema definition.
+    
+    Args:
+        table_name: Name of the table to create
+        schema: Dictionary mapping column names to types
+        connection: Optional existing connection
+        
+    Returns:
+        True if table was created or already exists
+    """
+    from config import generate_create_table_sql
+    
+    create_sql = generate_create_table_sql(table_name, schema)
+    
+    if connection:
+        cursor = connection.cursor()
+        cursor.execute(create_sql)
+        cursor.close()
+        return True
+    else:
+        with get_snowflake_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(create_sql)
+            cursor.close()
+            return True
+
+
+def insert_typed_records(
+    table_name: str,
+    records: List[Dict[str, Any]],
+    connection: Optional[snowflake.connector.connection] = None
+) -> int:
+    """
+    Insert typed records into Snowflake table.
+    
+    Args:
+        table_name: Target table name
+        records: List of dictionaries with typed data
+        connection: Optional existing connection
+        
+    Returns:
+        Number of records inserted
+    """
+    if not records:
+        return 0
+    
+    # Get column names from first record
+    columns = list(records[0].keys())
+    
+    # Build INSERT statement
+    columns_str = ", ".join(columns)
+    placeholders = ", ".join(["%s"] * len(columns))
+    insert_sql = f"""
+    INSERT INTO {table_name} ({columns_str})
+    VALUES ({placeholders})
+    """
+    
+    # Prepare data as tuples
+    data_tuples = [
+        tuple(record.get(col) for col in columns)
+        for record in records
+    ]
+    
+    if connection:
+        cursor = connection.cursor()
+        cursor.executemany(insert_sql, data_tuples)
+        cursor.close()
+        return len(data_tuples)
+    else:
+        with get_snowflake_connection() as conn:
+            cursor = conn.cursor()
+            cursor.executemany(insert_sql, data_tuples)
+            conn.commit()
+            cursor.close()
+            return len(data_tuples)
