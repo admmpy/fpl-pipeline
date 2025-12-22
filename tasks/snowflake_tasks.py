@@ -1,6 +1,8 @@
 """
 Snowflake loading tasks for FPL pipeline.
 """
+from utils.snowflake_client import create_typed_table, insert_typed_records
+from config import TABLE_SCHEMAS
 from prefect import task, get_run_logger
 from typing import Dict, Any, List, Optional
 import sys
@@ -157,3 +159,79 @@ def load_batch_to_snowflake(
         logger.error(f"Batch load failed: {e}")
         raise
 
+@task
+def ensure_typed_table_exists(table_name: str) -> bool:
+    """
+    Ensure a typed table exists in Snowflake using defined schema.
+    
+    Args:
+        table_name: Name of the table (must exist in TABLE_SCHEMAS)
+        
+    Returns:
+        True if successful, False if Snowflake not configured
+    """
+    logger = get_run_logger()
+    
+    # Check if Snowflake is configured
+    if get_snowflake_config() is None:
+        logger.warning(f"Snowflake not configured, skipping table creation for {table_name}")
+        return False
+    
+    # Check if schema is defined
+    if table_name not in TABLE_SCHEMAS:
+        logger.error(f"No schema defined for table: {table_name}")
+        return False
+    
+    try:
+        logger.info(f"Ensuring typed table {table_name} exists...")
+        
+        schema = TABLE_SCHEMAS[table_name]
+        create_typed_table(table_name, schema)
+        
+        logger.info(f"Table {table_name} ready")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Failed to create table {table_name}: {e}")
+        logger.warning(f"Continuing without Snowflake for {table_name}")
+        return False
+
+
+@task
+def load_typed_records_to_snowflake(
+    table_name: str,
+    records: List[Dict[str, Any]]
+) -> Dict[str, int]:
+    """
+    Load typed records to Snowflake table.
+    
+    Args:
+        table_name: Target table name
+        records: List of typed dictionaries (from transformation functions)
+        
+    Returns:
+        Dictionary with load statistics
+    """
+    logger = get_run_logger()
+    
+    # Check if Snowflake is configured
+    if get_snowflake_config() is None:
+        logger.warning(f"Snowflake not configured, skipping load to {table_name}")
+        return {"total": len(records), "loaded": 0}
+    
+    if not records:
+        logger.warning(f"No records to load to {table_name}")
+        return {"total": 0, "loaded": 0}
+    
+    try:
+        logger.info(f"Loading {len(records)} records to {table_name}...")
+        
+        count = insert_typed_records(table_name, records)
+        
+        logger.info(f"Successfully loaded {count} records to {table_name}")
+        return {"total": len(records), "loaded": count}
+        
+    except Exception as e:
+        logger.error(f"Failed to load records to {table_name}: {e}")
+        logger.warning(f"Continuing without Snowflake for {table_name}")
+        return {"total": len(records), "loaded": 0}

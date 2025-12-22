@@ -269,9 +269,165 @@ def fpl_complete_pipeline(
     return pipeline_results
 
 
+# =============================================================================
+# NEW TYPED FLOWS (Using typed columns instead of VARIANT)
+# =============================================================================
+
+from tasks.transformation_tasks import (
+    parse_players_from_bootstrap,
+    parse_teams_from_bootstrap,
+    parse_gameweeks_from_bootstrap,
+    parse_fixtures,
+)
+from tasks.snowflake_tasks import (
+    ensure_typed_table_exists,
+    load_typed_records_to_snowflake,
+)
+
+
+@flow(name="FPL Typed Static Data Ingestion", log_prints=True)
+def ingest_static_endpoints_typed() -> Dict[str, Any]:
+    """
+    Ingest static FPL endpoints using typed tables (not VARIANT).
+    
+    This is the NEW approach: JSON -> Parse -> Typed columns
+    
+    Returns:
+        Dictionary with results for each endpoint/table
+    """
+    logger = get_run_logger()
+    logger.info("Starting FPL static data ingestion (TYPED)...")
+    
+    results = {}
+    
+    # Step 1: Fetch bootstrap-static (contains players, teams, gameweeks)
+    logger.info("\nFetching bootstrap-static...")
+    try:
+        bootstrap_response = fetch_fpl_endpoint(
+            url=STATIC_ENDPOINTS["bootstrap_static"]["url"],
+            endpoint_name="bootstrap_static"
+        )
+        
+        # Get current gameweek for metadata
+        current_gw = extract_current_gameweek(bootstrap_response)
+        
+        # Parse into separate entity lists
+        players = parse_players_from_bootstrap(bootstrap_response, gameweek_id=current_gw)
+        teams = parse_teams_from_bootstrap(bootstrap_response)
+        gameweeks = parse_gameweeks_from_bootstrap(bootstrap_response)
+        
+        # Load players
+        logger.info("\nLoading players to Snowflake...")
+        ensure_typed_table_exists("players")
+        player_result = load_typed_records_to_snowflake("players", players)
+        results["players"] = {
+            "status": "success",
+            "records": player_result["loaded"],
+            "total": player_result["total"]
+        }
+        
+        # Load teams
+        logger.info("\nLoading teams to Snowflake...")
+        ensure_typed_table_exists("teams")
+        team_result = load_typed_records_to_snowflake("teams", teams)
+        results["teams"] = {
+            "status": "success",
+            "records": team_result["loaded"],
+            "total": team_result["total"]
+        }
+        
+        # Load gameweeks
+        logger.info("\nLoading gameweeks to Snowflake...")
+        ensure_typed_table_exists("gameweeks")
+        gameweek_result = load_typed_records_to_snowflake("gameweeks", gameweeks)
+        results["gameweeks"] = {
+            "status": "success",
+            "records": gameweek_result["loaded"],
+            "total": gameweek_result["total"]
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to process bootstrap-static: {e}")
+        results["bootstrap_static"] = {"status": "failed", "error": str(e)}
+    
+    # Step 2: Fetch and load fixtures
+    logger.info("\nFetching fixtures...")
+    try:
+        fixtures_response = fetch_fpl_endpoint(
+            url=STATIC_ENDPOINTS["fixtures"]["url"],
+            endpoint_name="fixtures"
+        )
+        
+        fixtures = parse_fixtures(fixtures_response)
+        
+        logger.info("\nLoading fixtures to Snowflake...")
+        ensure_typed_table_exists("fixtures")
+        fixture_result = load_typed_records_to_snowflake("fixtures", fixtures)
+        results["fixtures"] = {
+            "status": "success",
+            "records": fixture_result["loaded"],
+            "total": fixture_result["total"]
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to process fixtures: {e}")
+        results["fixtures"] = {"status": "failed", "error": str(e)}
+    
+    logger.info("\nTyped data ingestion complete!")
+    logger.info(f"   Results: {results}")
+    
+    return results
+
+
+@flow(name="FPL Complete Typed Pipeline", log_prints=True)
+def fpl_typed_pipeline() -> Dict[str, Any]:
+    """
+    Complete FPL data ingestion pipeline using TYPED tables.
+    
+    This is the new approach that replaces VARIANT columns with proper types.
+    
+    Returns:
+        Dictionary with complete pipeline results
+    """
+    logger = get_run_logger()
+    
+    print("\n" + "="*60)
+    print("FPL TYPED DATA PIPELINE")
+    print("="*60 + "\n")
+    
+    # Check Snowflake configuration
+    snowflake_config = get_snowflake_config()
+    if snowflake_config:
+        logger.info("Snowflake configured - data will be loaded to typed tables")
+    else:
+        logger.info("Snowflake not configured - data will be fetched but not loaded")
+    
+    # Ingest static endpoints (players, teams, gameweeks, fixtures)
+    print("\nSTEP 1: Ingesting static endpoints (typed)...")
+    results = ingest_static_endpoints_typed()
+    
+    print("\n" + "="*60)
+    print("PIPELINE COMPLETE!")
+    print("="*60 + "\n")
+    
+    # Print summary
+    print("Summary:")
+    for table, result in results.items():
+        if result["status"] == "success":
+            print(f"  [SUCCESS] {table}: {result['records']}/{result['total']} records")
+        else:
+            print(f"  [FAILED] {table}: {result.get('error', 'Unknown error')}")
+    
+    return results
+
+
 if __name__ == "__main__":
     # Run the complete pipeline
     # For testing, you can limit player details:
     # fpl_complete_pipeline(max_players=10)
     
-    fpl_complete_pipeline()
+    # Run OLD VARIANT approach:
+    # fpl_complete_pipeline()
+    
+    # Run NEW TYPED approach:
+    fpl_typed_pipeline()
