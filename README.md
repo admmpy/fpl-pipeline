@@ -1,34 +1,34 @@
 # FPL Data Pipeline
 
-A production-ready data pipeline for ingesting Fantasy Premier League (FPL) data using Prefect and Snowflake.
+A Python pipeline for ingesting Fantasy Premier League data into Snowflake using Prefect orchestration.
 
 ## Overview
 
-This pipeline fetches data from the FPL API and optionally loads it into Snowflake. It uses Prefect for orchestration, providing robust error handling, retries, and observability.
+Fetches data from the FPL API and loads it into Snowflake tables with proper typed columns. Built with Prefect for orchestration, error handling, and observability.
 
 ## Architecture
 
 ```
-FPL API → Fetch Tasks → Snowflake Tasks → Snowflake (raw JSON storage)
+FPL API → Fetch → Parse JSON → Load to Snowflake (typed columns)
 ```
 
-Data is stored as JSON in Snowflake VARIANT columns, ready for downstream transformation.
+Data is transformed in Python and inserted into properly typed Snowflake tables.
 
 ## Project Structure
 
 ```
 pipeline/
-├── config.py                 # Configuration & endpoints
+├── config.py                 # Endpoints, schemas, settings
 ├── .env                      # Snowflake credentials (not in git)
 ├── requirements.txt          # Python dependencies
 ├── flows/
 │   └── fpl_ingestion.py     # Main Prefect flow
 ├── tasks/
-│   ├── api_tasks.py         # API fetching tasks
-│   └── snowflake_tasks.py   # Snowflake loading tasks
-├── utils/
-│   └── snowflake_client.py  # Snowflake connection utilities
-└── test_pipeline.py         # Test script
+│   ├── api_tasks.py         # API fetching
+│   ├── transformation_tasks.py  # JSON parsing
+│   └── snowflake_tasks.py   # Database loading
+└── utils/
+    └── snowflake_client.py  # Connection management
 ```
 
 ## Quick Start
@@ -43,7 +43,7 @@ source venv/bin/activate
 pip list | grep prefect
 ```
 
-### 2. Configure Snowflake (Optional)
+### 2. Configure Snowflake
 
 Create a `.env` file:
 
@@ -56,76 +56,65 @@ SNOWFLAKE_DATABASE=your_database
 SNOWFLAKE_SCHEMA=your_schema
 ```
 
-**Note:** The pipeline works without Snowflake - it will fetch data but skip loading.
-
-### 3. Test the Pipeline
+### 3. Run the Pipeline
 
 ```bash
-# Test with limited data (no Snowflake required)
-python test_pipeline.py
-
-# Test full pipeline with Snowflake
-python test_pipeline.py --full
-```
-
-### 4. Run the Pipeline
-
-```bash
-# Run directly
+# Run the typed pipeline
 python flows/fpl_ingestion.py
-
-# Or import and run
-python -c "from flows.fpl_ingestion import fpl_complete_pipeline; fpl_complete_pipeline()"
 ```
 
-## Data Endpoints
-
-### Static Endpoints (Always Fetched)
-- **bootstrap_static**: Core data (players, teams, gameweeks, stats)
-- **fixtures**: Match fixtures and results
-- **overall_league**: Official FPL global league standings
-
-### Dynamic Endpoints (Conditional)
-- **element_summary**: Detailed stats per player (700+ players)
-- **live_gameweek**: Real-time data for current gameweek
-
-## Pipeline Options
+Or import and run:
 
 ```python
-from flows.fpl_ingestion import fpl_complete_pipeline
-
-# Full pipeline
-fpl_complete_pipeline()
-
-# Skip player details (faster)
-fpl_complete_pipeline(include_player_details=False)
-
-# Test with limited players
-fpl_complete_pipeline(max_players=10)
-
-# Static data only
-fpl_complete_pipeline(
-    include_player_details=False,
-    include_live_gameweek=False
-)
+from flows.fpl_ingestion import fpl_typed_pipeline
+fpl_typed_pipeline()
 ```
 
-## Snowflake Schema
+## Data Tables
 
-Each endpoint creates a table with this structure:
+The pipeline creates four Snowflake tables:
 
+### players
 ```sql
-CREATE TABLE raw_bootstrap_static (
-    id INTEGER AUTOINCREMENT,
-    ingestion_timestamp TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
-    data VARIANT,              -- Raw JSON from API
-    source_url VARCHAR(500),   -- API endpoint URL
-    endpoint_name VARCHAR(100), -- Endpoint identifier
-    PRIMARY KEY (id)
-);
+- player_id (PK)
+- web_name, first_name, second_name
+- team_id, position_id
+- now_cost, form, total_points
+- goals_scored, assists, clean_sheets
+- status, chance_of_playing_next_round
+- ingestion_timestamp, gameweek_fetched
 ```
 
-The `data` column stores the complete JSON response.
+### teams
+```sql
+- team_id (PK)
+- name, short_name
+- strength, position, points
+- strength_overall_home, strength_overall_away
+- strength_attack_home, strength_attack_away
+- strength_defence_home, strength_defence_away
+- ingestion_timestamp
+```
+
+### gameweeks
+```sql
+- gameweek_id (PK)
+- name, deadline_time
+- finished, is_current, is_next
+- average_entry_score, highest_score
+- most_selected, most_captained
+- ingestion_timestamp
+```
+
+### fixtures
+```sql
+- fixture_id (PK)
+- gameweek_id, kickoff_time
+- team_h, team_a
+- team_h_score, team_a_score
+- finished, started
+- ingestion_timestamp
+```
 
 ## Configuration
 
@@ -139,98 +128,94 @@ RETRY_DELAY = 5         # Seconds between retries
 
 ### Adding New Endpoints
 
-Edit `config.py`:
-
-```python
-# For static endpoints (no parameters)
-STATIC_ENDPOINTS = {
-    "new_endpoint": {
-        "url": f"{FPL_BASE_URL}/new-endpoint/",
-        "description": "Description",
-        "table": "raw_new_endpoint",
-    },
-}
-
-# For dynamic endpoints (with parameters)
-DYNAMIC_ENDPOINTS = {
-    "new_dynamic": {
-        "url_template": f"{FPL_BASE_URL}/endpoint/{{param_id}}/",
-        "description": "Description",
-        "table": "raw_new_dynamic",
-        "params": ["param_id"],
-        "id_source": "bootstrap_static",
-    },
-}
-```
+Edit `config.py` and add to `STATIC_ENDPOINTS` or `DYNAMIC_ENDPOINTS`. Then create corresponding schema in `TABLE_SCHEMAS` and parsing function in `transformation_tasks.py`.
 
 ## Scheduling
 
-### Option 1: Prefect Deployments
+### Prefect Deployment
 
 ```bash
 # Create a deployment
-prefect deployment build flows/fpl_ingestion.py:fpl_complete_pipeline \
-    --name "FPL Daily Ingestion" \
-    --cron "0 2 * * *"  # Run daily at 2 AM
+prefect deployment build flows/fpl_ingestion.py:fpl_typed_pipeline \
+    --name "FPL Weekly Ingestion" \
+    --cron "0 2 * * 4"  # Every Thursday at 2 AM
 
-# Apply the deployment
-prefect deployment apply fpl_complete_pipeline-deployment.yaml
-
-# Start a worker
+# Apply and start worker
+prefect deployment apply fpl_typed_pipeline-deployment.yaml
 prefect worker start --pool default
 ```
 
-### Option 2: Cron Job
+### Cron Job
 
 ```bash
-# Add to crontab
-0 2 * * * cd /path/to/pipeline && source venv/bin/activate && python flows/fpl_ingestion.py
+# Add to crontab (runs every Thursday at 2 AM)
+0 2 * * 4 cd /path/to/pipeline && source venv/bin/activate && python flows/fpl_ingestion.py
 ```
 
-## Testing
+## Example Queries
 
-```bash
-# Test API connectivity
-python -c "from tasks.api_tasks import fetch_fpl_endpoint; print(fetch_fpl_endpoint.fn('https://fantasy.premierleague.com/api/bootstrap-static/', 'test'))"
+```sql
+-- Top scoring players
+SELECT web_name, total_points, now_cost/10.0 as price
+FROM players
+ORDER BY total_points DESC
+LIMIT 10;
 
-# Test Snowflake connection
-python -c "from utils.snowflake_client import test_connection; test_connection()"
+-- Best value players (points per million)
+SELECT web_name, total_points, 
+       now_cost/10.0 as price,
+       (total_points / (now_cost/10.0)) as value
+FROM players
+WHERE minutes > 500
+ORDER BY value DESC
+LIMIT 10;
 
-# Run test suite
-python test_pipeline.py
+-- Team standings
+SELECT name, position, points
+FROM teams
+ORDER BY position;
+
+-- Upcoming fixtures
+SELECT f.fixture_id, 
+       h.name as home_team,
+       a.name as away_team,
+       f.kickoff_time
+FROM fixtures f
+JOIN teams h ON f.team_h = h.team_id
+JOIN teams a ON f.team_a = a.team_id
+WHERE f.finished = FALSE
+ORDER BY f.kickoff_time;
 ```
 
 ## Troubleshooting
 
 ### "Snowflake not configured"
 - Create `.env` file with credentials
-- Or run without Snowflake (data will be fetched but not loaded)
+- Pipeline will fetch data but skip loading without Snowflake
 
 ### "Rate limit exceeded"
 - Increase `RATE_LIMIT_DELAY` in `config.py`
-- Reduce `max_players` parameter
 
 ### "Connection timeout"
 - Check internet connection
-- FPL API may be down (check https://fantasy.premierleague.com)
+- FPL API may be temporarily down
 
 ## Key Features
 
-- **Graceful Error Handling**: Continues if one endpoint fails
-- **Automatic Retries**: Configurable retry logic for failed requests
+- **Typed Columns**: Data loaded with proper types (INTEGER, VARCHAR, FLOAT)
+- **Normalized Tables**: Separate tables for players, teams, gameweeks, fixtures
+- **Error Handling**: Retries, graceful failures, detailed logging
 - **Rate Limiting**: Respects FPL API limits
-- **Optional Snowflake**: Works with or without database
-- **Prefect Observability**: Track all runs in Prefect UI
-- **Flexible Execution**: Skip endpoints, limit data for testing
+- **Prefect Orchestration**: Task dependencies, observability, scheduling
+- **Query Ready**: Data immediately available for analysis
 
-## Files
+## Dependencies
 
-- **config.py**: All configuration and endpoint definitions
-- **flows/fpl_ingestion.py**: Main pipeline orchestration
-- **tasks/api_tasks.py**: API fetching logic with retries
-- **tasks/snowflake_tasks.py**: Database loading logic
-- **utils/snowflake_client.py**: Connection management
-- **test_pipeline.py**: Testing script
+- Python 3.12+
+- Prefect 3.x (orchestration)
+- snowflake-connector-python (database)
+- requests (HTTP)
+- python-dotenv (configuration)
 
 ## License
 
