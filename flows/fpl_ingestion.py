@@ -427,7 +427,7 @@ if __name__ == "__main__":
     # fpl_complete_pipeline(max_players=10)
     
     # Run OLD VARIANT approach:
-    # fpl_complete_pipeline()
+    fpl_complete_pipeline(include_player_details=True, max_players=10)
     
     # Run NEW TYPED approach:
-    fpl_typed_pipeline()
+    # fpl_typed_pipeline()
