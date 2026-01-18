@@ -16,10 +16,20 @@ def fetch_training_data(table_name: str = "fct_ml_player_features") -> pd.DataFr
     logger = get_run_logger()
     logger.info(f"Fetching features from {table_name}...")
     
-    query = f"SELECT * FROM {table_name}"
+    query = f"""
+    SELECT 
+        f.* EXCLUDE (now_cost),
+        COALESCE(f.now_cost, p.current_value) AS now_cost,
+        p.position_id
+    FROM {table_name} f
+    LEFT JOIN dim_players p ON f.player_id = p.player_id
+    """
     
     with get_snowflake_connection() as conn:
         df = pd.read_sql(query, conn)
+    
+    # Standardize column names to lowercase (Snowflake returns UPPERCASE by default)
+    df.columns = [c.lower() for c in df.columns]
         
     logger.info(f"Fetched {len(df)} rows.")
     return df
