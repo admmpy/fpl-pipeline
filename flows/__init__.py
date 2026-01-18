@@ -13,5 +13,6 @@ __all__ = [
     "ingest_player_details",
     "ingest_live_gameweek",
     "fpl_complete_pipeline",
+    "fpl_weekly_orchestration",
 ]
 
