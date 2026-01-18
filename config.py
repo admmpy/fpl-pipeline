@@ -210,3 +210,31 @@ def generate_create_table_sql(table_name: str, schema: Dict[str, str]) -> str:
 );"""
     
     return sql
+
+# =============================================================================
+# OPTIMIZATION CONFIGURATION
+# =============================================================================
+
+OPTIMIZATION_CONFIG = {
+    "optimization": {
+        "budget": 100.0,
+        "solver": "ECOS_BB",
+        "squad_constraints": {
+            "total_players": 15,
+            "goalkeeper_count": 2,
+            "defender_count": 5,
+            "midfielder_count": 5,
+            "forward_count": 3,
+            "max_per_team": 3,
+        },
+        "starting_constraints": {
+            "total_players": 11,
+            "min_goalkeeper": 1,
+            "min_defender": 3,
+            "min_midfielder": 2,
+            "min_forward": 1,
+        },
+        "transfer_penalty": 4.0,
+        "max_transfers": 15,  # Wildcard mode by default
+    }
+}

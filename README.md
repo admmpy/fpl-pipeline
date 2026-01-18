@@ -145,6 +145,26 @@ prefect deployment apply fpl_typed_pipeline-deployment.yaml
 prefect worker start --pool default
 ```
 
+### Weekly Orchestration (ML + Optimisation)
+
+The orchestration flow runs ingestion, dbt, ML inference, and squad optimisation:
+
+```bash
+python deploy.py
+```
+
+Start a local worker to pick up scheduled runs:
+
+```bash
+prefect worker start --pool local-mac-worker
+```
+
+If you want Slack alerts, add this to your `.env`:
+
+```bash
+SLACK_WEBHOOK_URL=your_webhook_url
+```
+
 ### Cron Job
 
 ```bash
