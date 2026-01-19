@@ -4,15 +4,25 @@ A Python pipeline for ingesting Fantasy Premier League data into Snowflake using
 
 ## Overview
 
-Fetches data from the FPL API and loads it into Snowflake tables with proper typed columns. Built with Prefect for orchestration, error handling, and observability.
+Fetches data from the FPL API and loads it into Snowflake using a **HYBRID** approach. Built with Prefect for orchestration, error handling, and observability.
 
 ## Architecture
 
+### Hybrid Strategy
+
 ```
-FPL API → Fetch → Parse JSON → Load to Snowflake (typed columns)
+FPL API 
+  ├→ Static Data (bootstrap, fixtures)
+  │    → Parse to typed records → MERGE into typed tables
+  │
+  └→ Player History (element-summary)  
+       → Keep as JSON → INSERT into VARIANT table
 ```
 
-Data is transformed in Python and inserted into properly typed Snowflake tables.
+**Typed Tables (MERGE/UPSERT):** players, teams, gameweeks, fixtures  
+**VARIANT Tables (INSERT):** raw_element_summary
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed data flow diagrams.
 
 ## Project Structure
 
