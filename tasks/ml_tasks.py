@@ -76,9 +76,9 @@ def prepare_inference_data(df: pd.DataFrame) -> pd.DataFrame:
     return df_clean
 
 @task
-def run_ml_inference(df: pd.DataFrame, model_path: str = "model.bin") -> List[Dict[str, Any]]:
+def run_ml_inference(df: pd.DataFrame, model_path: str = "logs/model.bin") -> List[Dict[str, Any]]:
     """
-    Run ML inference using the trained XGBoost/LightGBM model.
+    Run ML inference using the trained XGBoost model.
     
     Args:
         df: Prepared DataFrame with features.
@@ -95,17 +95,79 @@ def run_ml_inference(df: pd.DataFrame, model_path: str = "model.bin") -> List[Di
     
     logger.info(f"Running ML inference for GW {target_gw}...")
     
-    # In a real scenario, you would do something like:
-    # model = load_model(model_path)
-    # df['predicted_points'] = model.predict(df[features])
-    
-    # SIMULATION: Using a weighted average of rolling points and Z-scores for now
-    # until the actual model.bin is available.
-    df['expected_points_next_gw'] = (
-        df['three_week_players_roll_avg_points'].fillna(2.0) * 0.7 + 
-        df['total_points_z_score'].fillna(0) * 1.5 + 
-        2.0 # Baseline
-    ).clip(lower=0)
+    # Check if model file exists
+    if not os.path.exists(model_path):
+        logger.warning(f"Model file not found at {model_path}")
+        logger.warning("Falling back to heuristic predictions. Run 'python train_model.py' to create model.")
+        
+        # Fallback: heuristic prediction
+        df['expected_points_next_gw'] = (
+            df['three_week_players_roll_avg_points'].fillna(2.0) * 0.7 + 
+            df['total_points_z_score'].fillna(0) * 1.5 + 
+            2.0
+        ).clip(lower=0)
+    else:
+        # Load trained model
+        logger.info(f"Loading model from {model_path}...")
+        import pickle
+        with open(model_path, 'rb') as f:
+            model = pickle.load(f)
+        
+        # Define feature set (must match training)
+        feature_cols = [
+            'total_points', 'minutes_played', 'goals_scored', 'assists', 
+            'clean_sheets', 'goals_conceded', 'bonus', 'ict_index', 
+            'influence', 'creativity', 'threat',
+            'expected_goals', 'expected_assists', 'expected_goals_conceded', 
+            'expected_goal_involvements',
+            'three_week_players_roll_avg_points', 'five_week_players_roll_avg_points', 
+            'total_games_played',
+            'team_roll_avg_goals_scored', 'team_roll_avg_xg', 
+            'team_roll_avg_clean_sheets', 'team_roll_avg_wins_pct',
+            'opponent_roll_avg_goals_conceded', 'opponent_roll_avg_xg',
+            'opponent_defence_strength', 'team_attack_strength',
+            'team_position', 'opponent_team_position', 'team_position_difference',
+            'form', 'now_cost',
+            'total_points_z_score', 'minutes_played_z_score', 'ict_index_z_score',
+            'is_gk', 'is_def', 'is_mid', 'is_fwd',
+            'is_home'
+        ]
+        
+        # Engineer additional features needed for inference
+        # Position encoding
+        df['is_gk'] = (df['position_id'] == 1).astype(int)
+        df['is_def'] = (df['position_id'] == 2).astype(int)
+        df['is_mid'] = (df['position_id'] == 3).astype(int)
+        df['is_fwd'] = (df['position_id'] == 4).astype(int)
+        
+        # Home advantage (assume neutral for future prediction)
+        df['is_home'] = 0
+        
+        # Filter to only features that exist in the dataframe
+        available_features = [f for f in feature_cols if f in df.columns]
+        missing_features = [f for f in feature_cols if f not in df.columns]
+        
+        if missing_features:
+            logger.warning(f"Missing {len(missing_features)} features, filling with zeros: {missing_features[:5]}")
+            for feat in missing_features:
+                df[feat] = 0
+            available_features = feature_cols  # Use all after filling
+        
+        # Get latest stats for each player
+        latest_stats = df.sort_values('gameweek_id').groupby('player_id').tail(1).copy()
+        
+        # Make predictions
+        X_inference = latest_stats[available_features].fillna(0)
+        predictions_array = model.predict(X_inference)
+        
+        # Clip negative predictions to zero
+        predictions_array = np.maximum(predictions_array, 0)
+        
+        latest_stats['expected_points_next_gw'] = predictions_array
+        
+        logger.info(f"Model predictions: min={predictions_array.min():.2f}, max={predictions_array.max():.2f}, mean={predictions_array.mean():.2f}")
+        
+        df = latest_stats
     
     # Get only the latest available stats for each player to predict the next GW
     latest_stats = df.sort_values('gameweek_id').groupby('player_id').tail(1)

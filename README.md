@@ -22,23 +22,22 @@ FPL API
 **Typed Tables (MERGE/UPSERT):** players, teams, gameweeks, fixtures  
 **VARIANT Tables (INSERT):** raw_element_summary
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed data flow diagrams.
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed data flow diagrams.
 
 ## Project Structure
 
 ```
 pipeline/
-├── config.py                 # Endpoints, schemas, settings
-├── .env                      # Snowflake credentials (not in git)
-├── requirements.txt          # Python dependencies
-├── flows/
-│   └── fpl_ingestion.py     # Main Prefect flow
-├── tasks/
-│   ├── api_tasks.py         # API fetching
-│   ├── transformation_tasks.py  # JSON parsing
-│   └── snowflake_tasks.py   # Database loading
-└── utils/
-    └── snowflake_client.py  # Connection management
+├── docs/                     # Documentation (Architecture, ML, etc.)
+├── flows/                    # Prefect orchestration
+├── resources/                # Static resources (endpoints, etc.)
+├── scripts/                  # Entry points and training scripts
+├── tasks/                    # Atomic pipeline operations
+├── tests/                    # Unit and integration tests
+├── utils/                    # Database clients and helpers
+├── config.py                 # Core configuration
+├── README.md                 # Project overview
+└── requirements.txt          # Python dependencies
 ```
 
 ## Quick Start
@@ -160,7 +159,13 @@ prefect worker start --pool default
 The orchestration flow runs ingestion, dbt, ML inference, and squad optimisation:
 
 ```bash
-python deploy.py
+python scripts/deploy.py
+```
+
+To run a one-off test of the full pipeline:
+
+```bash
+python scripts/run_once.py
 ```
 
 Start a local worker to pick up scheduled runs:
