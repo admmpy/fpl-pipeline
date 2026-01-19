@@ -76,6 +76,23 @@ def get_snowflake_config() -> Optional[Dict[str, str]]:
     
     return config
 
+
+# Slack Configuration
+def get_slack_config() -> Optional[str]:
+    """
+    Load Slack webhook URL from environment.
+    
+    Returns:
+        Slack webhook URL if configured, None otherwise
+    """
+    webhook_url = os.getenv("SLACK_WEBHOOK_URL")
+    
+    if not webhook_url:
+        print("INFO: SLACK_WEBHOOK_URL not configured. Notifications disabled.")
+        return None
+    
+    return webhook_url
+
 # Pipeline Settings
 RATE_LIMIT_DELAY = 0.5  # Seconds between API calls
 MAX_RETRIES = 3
