@@ -14,7 +14,6 @@ if __name__ == "__main__":
     print("Starting test run of FPL Weekly Orchestration...")
     result = fpl_weekly_orchestration(
         include_player_details=True,
-        include_live_gameweek=True,
         max_players=10,  # Small sample for testing
         allow_stale_data=True
     )

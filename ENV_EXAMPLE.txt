@@ -1,0 +1,36 @@
+# FPL Pipeline Environment Configuration
+# Copy this file to .env and fill in your credentials
+# NEVER commit .env to version control
+
+# =============================================================================
+# SNOWFLAKE CONFIGURATION
+# =============================================================================
+# Snowflake connection details for data warehouse
+SNOWFLAKE_ACCOUNT=your_account.region
+SNOWFLAKE_USER=your_username
+SNOWFLAKE_PASSWORD=your_password
+SNOWFLAKE_DATABASE=FPL
+SNOWFLAKE_SCHEMA=RAW
+SNOWFLAKE_WAREHOUSE=COMPUTE_WH
+
+# =============================================================================
+# SLACK CONFIGURATION
+# =============================================================================
+# Slack webhook URL for pipeline notifications and alerts
+# Get this from: https://api.slack.com/apps → Your App → Incoming Webhooks
+# Example: https://hooks.slack.com/services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXX
+SLACK_WEBHOOK_URL=
+
+# =============================================================================
+# PIPELINE CONFIGURATION (Optional)
+# =============================================================================
+# These have defaults in code but can be overridden here if needed
+
+# FPL API rate limiting (seconds between requests)
+# RATE_LIMIT_DELAY=0.5
+
+# Number of retries for failed API requests
+# MAX_RETRIES=3
+
+# Delay between retries (seconds)
+# RETRY_DELAY=5

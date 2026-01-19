@@ -174,11 +174,29 @@ Start a local worker to pick up scheduled runs:
 prefect worker start --pool local-mac-worker
 ```
 
-If you want Slack alerts, add this to your `.env`:
+### Slack Notifications
+
+The pipeline automatically sends Slack alerts for failures and can optionally send success summaries.
+
+1. Create a Slack webhook at [https://api.slack.com/apps](https://api.slack.com/apps)
+2. Add to your `.env` file:
 
 ```bash
-SLACK_WEBHOOK_URL=your_webhook_url
+SLACK_WEBHOOK_URL=https://hooks.slack.com/services/YOUR/WEBHOOK/URL
 ```
+
+3. Test the integration:
+
+```bash
+python scripts/test_slack.py
+```
+
+**Automatic Alerts:**
+- Pipeline failures (entire orchestration)
+- Source failures (data ingestion issues)
+- Squad recommendations after optimization
+
+See [docs/SLACK_INTEGRATION.md](docs/SLACK_INTEGRATION.md) for full documentation
 
 ### Cron Job
 

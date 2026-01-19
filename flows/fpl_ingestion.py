@@ -2,6 +2,7 @@
 Main Prefect flow for FPL data ingestion.
 """
 from prefect import flow, get_run_logger
+from prefect.states import State
 from typing import Dict, Any, Optional
 import sys
 import os
@@ -18,6 +19,30 @@ from tasks import (
     load_to_snowflake,
     load_batch_to_snowflake,
 )
+from tasks.reporting_tasks import notify_source_failure
+
+
+def ingestion_failure_hook(flow_run, flow_state: State) -> None:
+    """
+    Hook called when the ingestion flow fails.
+    
+    Sends a source failure alert to Slack.
+    
+    Args:
+        flow_run: The flow run object
+        flow_state: The failed state object
+    """
+    flow_name = flow_run.name or "FPL Ingestion"
+    error_message = str(flow_state.message) if flow_state.message else "Unknown error"
+    
+    # Attempt to send failure notification
+    try:
+        notify_source_failure.fn(
+            source_name=flow_name,
+            error_message=error_message
+        )
+    except Exception as e:
+        print(f"Failed to send Slack source failure notification: {e}")
 
 
 @flow(name="FPL Static Data Ingestion", log_prints=True)
@@ -384,7 +409,11 @@ def ingest_static_endpoints_typed() -> Dict[str, Any]:
     }
 
 
-@flow(name="FPL Complete Typed Pipeline", log_prints=True)
+@flow(
+    name="FPL Complete Typed Pipeline",
+    log_prints=True,
+    on_failure=[ingestion_failure_hook]
+)
 def fpl_typed_pipeline(
     include_player_details: bool = True,
     max_players: Optional[int] = None

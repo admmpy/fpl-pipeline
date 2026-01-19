@@ -61,20 +61,39 @@ To run just the ingestion part:
 python flows/fpl_ingestion.py
 ```
 
-## Setting Up Snowflake
+## Setting Up Configuration
 
-Create `.env` file:
+Create a `.env` file in the `pipeline/` directory with your credentials:
 
 ```bash
+# Snowflake Configuration
 SNOWFLAKE_ACCOUNT=your_account
 SNOWFLAKE_USER=your_user  
 SNOWFLAKE_PASSWORD=your_password
 SNOWFLAKE_WAREHOUSE=your_warehouse
 SNOWFLAKE_DATABASE=your_database
 SNOWFLAKE_SCHEMA=your_schema
+
+# Slack Configuration (Optional)
+SLACK_WEBHOOK_URL=https://hooks.slack.com/services/YOUR/WEBHOOK/URL
 ```
 
-Without this, the pipeline will fetch data but skip loading to Snowflake.
+### Snowflake
+Without Snowflake credentials, the pipeline will fetch data but skip loading to the database.
+
+### Slack Notifications (Optional)
+Get automatic alerts when:
+- The pipeline fails
+- Critical data sources fail
+- Squad recommendations are ready
+
+To set up:
+1. Go to [https://api.slack.com/apps](https://api.slack.com/apps)
+2. Create an app and enable "Incoming Webhooks"
+3. Add webhook URL to your `.env` file
+4. Test with: `python scripts/test_slack.py`
+
+See [SLACK_INTEGRATION.md](SLACK_INTEGRATION.md) for full setup guide.
 
 ## Verifying Your Data
 
