@@ -171,12 +171,31 @@ FIXTURE_SCHEMA = {
     "ingestion_timestamp": "TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()",
 }
 
+# Recommended Squad Schema - Output from ML/Optimization pipeline
+RECOMMENDED_SQUAD_SCHEMA = {
+    "recommendation_key": "VARCHAR(100) NOT NULL",
+    "recommended_at": "TIMESTAMP_NTZ",
+    "player_id": "INTEGER",
+    "web_name": "VARCHAR(100)",
+    "position_id": "INTEGER",
+    "team_id": "INTEGER",
+    "now_cost": "FLOAT",
+    "gameweek_id": "INTEGER",
+    "expected_points_next_gw": "FLOAT",
+    "expected_points_5_gw": "FLOAT",
+    "is_in_squad": "BOOLEAN",
+    "is_starter": "BOOLEAN",
+    "is_captain": "BOOLEAN",
+    "is_vice_captain": "BOOLEAN",
+}
+
 # Map table names to their schemas
 TABLE_SCHEMAS = {
     "players": PLAYER_SCHEMA,
     "teams": TEAM_SCHEMA,
     "gameweeks": GAMEWEEK_SCHEMA,
     "fixtures": FIXTURE_SCHEMA,
+    "recommended_squad": RECOMMENDED_SQUAD_SCHEMA,
 }
 
 
