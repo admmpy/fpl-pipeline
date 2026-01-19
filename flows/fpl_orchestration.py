@@ -12,7 +12,7 @@ from tasks.dbt_tasks import run_dbt_command
 from tasks.ml_tasks import fetch_training_data, prepare_inference_data, run_ml_inference
 from tasks.optimizer_tasks import optimize_squad_task
 from tasks.reporting_tasks import format_squad_summary, send_slack_notification
-from tasks.snowflake_tasks import load_typed_records_to_snowflake
+from tasks.snowflake_tasks import load_typed_records_to_snowflake, ensure_typed_table_exists
 
 
 @flow(name="FPL Weekly Orchestration", log_prints=True)
@@ -68,7 +68,7 @@ def fpl_weekly_orchestration(
     recommended_squad = optimize_squad_task(predictions)
 
     # 5. Load Recommendations to Snowflake
-    # Note: User manages the table creation for recommended_squad
+    ensure_typed_table_exists("recommended_squad")
     load_result = load_typed_records_to_snowflake(
         table_name="recommended_squad",
         records=recommended_squad

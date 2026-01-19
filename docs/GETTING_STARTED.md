@@ -43,15 +43,23 @@ One API call (bootstrap-static) is split into three normalized tables (players, 
 ```bash
 cd /Users/am/Sync/fpl-workspace/pipeline
 source venv/bin/activate
-python flows/fpl_ingestion.py
+
+# Run the full orchestration (Ingestion + dbt + ML + Optimization)
+python scripts/run_once.py
 ```
 
 This will:
-1. Fetch bootstrap-static (players, teams, gameweeks)
-2. Fetch fixtures
-3. Parse all data into typed dictionaries
-4. Create Snowflake tables if needed
-5. Load all data
+1. Fetch core data (players, teams, gameweeks, fixtures)
+2. Run dbt models to build features
+3. Run ML inference using XGBoost
+4. Run squad optimization
+5. Load recommendations to Snowflake
+
+To run just the ingestion part:
+
+```bash
+python flows/fpl_ingestion.py
+```
 
 ## Setting Up Snowflake
 

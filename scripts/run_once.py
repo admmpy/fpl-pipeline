@@ -3,6 +3,12 @@ Simple test runner for FPL pipeline - runs once without scheduling.
 
 Use this to test the pipeline before deploying with a schedule.
 """
+import sys
+import os
+
+# Add parent directory to path to allow imports from flows, tasks, etc.
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from flows.fpl_orchestration import fpl_weekly_orchestration
 
 def run_pipeline():

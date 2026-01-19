@@ -273,8 +273,9 @@ def insert_typed_records(
                 f"target.{col} = source.{col}" for col in update_columns
             ])
             
-            # Add ingestion_timestamp update
-            update_set += ", target.ingestion_timestamp = CURRENT_TIMESTAMP()"
+            # Add ingestion_timestamp update when column exists
+            if table_name in {"players", "teams", "gameweeks", "fixtures"}:
+                update_set += ", target.ingestion_timestamp = CURRENT_TIMESTAMP()"
             
             # Build MERGE statement
             merge_sql = f"""

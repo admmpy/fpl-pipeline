@@ -1,6 +1,12 @@
 """
 Script to deploy the FPL Weekly Orchestration flow (Prefect 3.x).
 """
+import sys
+import os
+
+# Add parent directory to path to allow imports from flows, tasks, etc.
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from flows.fpl_orchestration import fpl_weekly_orchestration
 
 def deploy():
@@ -21,7 +27,7 @@ def deploy():
     
     fpl_weekly_orchestration.serve(
         name="Weekly FPL Strategy Run",
-        cron="0 9 * * 2",  # Every Tuesday at 9:00 AM
+        cron="0 9 * * *",  # Every day at 9:00 AM
         tags=["production", "fpl"],
         parameters={
             "include_player_details": True,  # Fetch raw_element_summary (VARIANT)

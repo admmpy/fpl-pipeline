@@ -30,5 +30,5 @@ build/
 .DS_Store
 Thumbs.db
 
-# DBT
+# DBT and ML
 logs/
