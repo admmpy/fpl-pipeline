@@ -221,7 +221,7 @@ def insert_typed_records(
         "teams": "team_id",
         "gameweeks": "gameweek_id",
         "fixtures": "fixture_id",
-        "fct_recommended_squad": "recommendation_key",
+        "recommended_squad": "recommendation_key",
     }
     
     if table_name not in primary_keys:

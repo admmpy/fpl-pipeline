@@ -68,9 +68,9 @@ def fpl_weekly_orchestration(
     recommended_squad = optimize_squad_task(predictions)
 
     # 5. Load Recommendations to Snowflake
-    # Note: User manages the table creation for fct_recommended_squad
+    # Note: User manages the table creation for recommended_squad
     load_result = load_typed_records_to_snowflake(
-        table_name="fct_recommended_squad",
+        table_name="recommended_squad",
         records=recommended_squad
     )
 
