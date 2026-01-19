@@ -299,6 +299,7 @@ def ingest_static_endpoints_typed() -> Dict[str, Any]:
     logger.info("Starting FPL static data ingestion (TYPED)...")
     
     results = {}
+    bootstrap_response = None
     
     # Step 1: Fetch bootstrap-static (contains players, teams, gameweeks)
     logger.info("\nFetching bootstrap-static...")
@@ -349,6 +350,7 @@ def ingest_static_endpoints_typed() -> Dict[str, Any]:
     except Exception as e:
         logger.error(f"Failed to process bootstrap-static: {e}")
         results["bootstrap_static"] = {"status": "failed", "error": str(e)}
+        bootstrap_response = None
     
     # Step 2: Fetch and load fixtures
     logger.info("\nFetching fixtures...")
@@ -376,58 +378,102 @@ def ingest_static_endpoints_typed() -> Dict[str, Any]:
     logger.info("\nTyped data ingestion complete!")
     logger.info(f"   Results: {results}")
     
-    return results
+    return {
+        "results": results,
+        "bootstrap_data": bootstrap_response,
+    }
 
 
 @flow(name="FPL Complete Typed Pipeline", log_prints=True)
-def fpl_typed_pipeline() -> Dict[str, Any]:
+def fpl_typed_pipeline(
+    include_player_details: bool = True,
+    max_players: Optional[int] = None
+) -> Dict[str, Any]:
     """
-    Complete FPL data ingestion pipeline using TYPED tables.
+    Complete FPL data ingestion pipeline using HYBRID approach:
+    - Typed tables (MERGE/UPSERT): players, teams, gameweeks, fixtures
+    - VARIANT (INSERT): raw_element_summary (complex player history)
     
-    This is the new approach that replaces VARIANT columns with proper types.
+    Args:
+        include_player_details: Whether to fetch detailed player history (VARIANT)
+        max_players: Optional limit on players (for testing)
     
     Returns:
         Dictionary with complete pipeline results
     """
     logger = get_run_logger()
     
-    print("\n" + "="*60)
-    print("FPL TYPED DATA PIPELINE")
-    print("="*60 + "\n")
+    logger.info("=" * 60)
+    logger.info("FPL HYBRID DATA PIPELINE")
+    logger.info("=" * 60)
     
     # Check Snowflake configuration
     snowflake_config = get_snowflake_config()
     if snowflake_config:
-        logger.info("Snowflake configured - data will be loaded to typed tables")
+        logger.info("Snowflake configured - data will be loaded")
+        logger.info("  - Typed tables (MERGE): players, teams, gameweeks, fixtures")
+        logger.info("  - VARIANT (INSERT): raw_element_summary")
     else:
         logger.info("Snowflake not configured - data will be fetched but not loaded")
     
-    # Ingest static endpoints (players, teams, gameweeks, fixtures)
-    print("\nSTEP 1: Ingesting static endpoints (typed)...")
-    results = ingest_static_endpoints_typed()
+    pipeline_results = {}
     
-    print("\n" + "="*60)
-    print("PIPELINE COMPLETE!")
-    print("="*60 + "\n")
+    # Step 1: Ingest static endpoints to TYPED tables (with MERGE/UPSERT)
+    logger.info("STEP 1: Ingesting static endpoints (typed with MERGE)...")
+    typed_payload = ingest_static_endpoints_typed()
+    typed_results = typed_payload["results"]
+    bootstrap_response = typed_payload.get("bootstrap_data")
+    pipeline_results["typed_tables"] = typed_results
+    
+    # Step 2: Ingest player details to VARIANT table (raw_element_summary)
+    if include_player_details and bootstrap_response:
+        logger.info("STEP 2: Ingesting player details (VARIANT)...")
+
+        player_results = ingest_player_details(
+            bootstrap_data=bootstrap_response,
+            max_players=max_players
+        )
+        pipeline_results["player_details"] = player_results
+    else:
+        if include_player_details:
+            logger.warning("Skipping player details ingestion - bootstrap data unavailable")
+        else:
+            logger.info("Skipping player details ingestion")
+        pipeline_results["player_details"] = {"status": "skipped"}
+    
+    logger.info("=" * 60)
+    logger.info("PIPELINE COMPLETE!")
+    logger.info("=" * 60)
     
     # Print summary
-    print("Summary:")
-    for table, result in results.items():
+    logger.info("Summary - Typed Tables:")
+    for table, result in typed_results.items():
         if result["status"] == "success":
-            print(f"  [SUCCESS] {table}: {result['records']}/{result['total']} records")
+            logger.info(
+                "  [SUCCESS] %s: %s/%s records",
+                table,
+                result["records"],
+                result["total"],
+            )
         else:
-            print(f"  [FAILED] {table}: {result.get('error', 'Unknown error')}")
+            logger.error("  [FAILED] %s: %s", table, result.get("error", "Unknown error"))
     
-    return results
+    if include_player_details:
+        logger.info("Summary - VARIANT Tables:")
+        pd_result = pipeline_results["player_details"]
+        if pd_result["status"] == "success":
+            load_res = pd_result["load_results"]
+            logger.info(
+                "  [SUCCESS] raw_element_summary: %s/%s records",
+                load_res["success"],
+                load_res["total"],
+            )
+        else:
+            logger.error("  [FAILED] raw_element_summary")
+    
+    return pipeline_results
 
 
 if __name__ == "__main__":
-    # Run the complete pipeline
-    # For testing, you can limit player details:
-    # fpl_complete_pipeline(max_players=10)
-    
-    # Run OLD VARIANT approach:
-    fpl_complete_pipeline(include_player_details=True, max_players=None)
-    
-    # Run NEW TYPED approach:
-    # fpl_typed_pipeline()
+    # Run the hybrid pipeline (typed tables + raw_element_summary)
+    fpl_typed_pipeline(include_player_details=True, max_players=None)

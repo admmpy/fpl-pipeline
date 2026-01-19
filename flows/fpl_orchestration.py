@@ -7,7 +7,7 @@ from typing import Dict, Any, Optional
 
 from prefect import flow, get_run_logger
 
-from flows.fpl_ingestion import fpl_complete_pipeline
+from flows.fpl_ingestion import fpl_typed_pipeline  # Use TYPED pipeline with MERGE/UPSERT
 from tasks.dbt_tasks import run_dbt_command
 from tasks.ml_tasks import fetch_training_data, prepare_inference_data, run_ml_inference
 from tasks.optimizer_tasks import optimize_squad_task
@@ -18,7 +18,6 @@ from tasks.snowflake_tasks import load_typed_records_to_snowflake
 @flow(name="FPL Weekly Orchestration", log_prints=True)
 def fpl_weekly_orchestration(
     include_player_details: bool = True,
-    include_live_gameweek: bool = True,
     max_players: Optional[int] = None,
     dbt_project_dir: str = "/Users/am/Sync/fpl-workspace/fpl_development",
     dbt_profiles_dir: Optional[str] = None,
@@ -27,15 +26,26 @@ def fpl_weekly_orchestration(
 ) -> Dict[str, Any]:
     """
     Orchestrate FPL ingestion, dbt transformations, ML inference, and optimization.
+    
+    Uses HYBRID pipeline:
+    - TYPED tables with MERGE/UPSERT: players, teams, gameweeks, fixtures
+    - VARIANT with INSERT: raw_element_summary (player history)
+    
+    Args:
+        include_player_details: Whether to fetch raw_element_summary (VARIANT)
+        max_players: Optional limit for testing
+        dbt_project_dir: Path to dbt project
+        dbt_profiles_dir: Optional dbt profiles directory
+        allow_stale_data: Continue if dbt fails
+        slack_webhook_url: Optional Slack webhook for notifications
     """
     logger = get_run_logger()
     logger.info("Starting weekly orchestration...")
 
-    # 1. Ingestion
-    ingestion_results = fpl_complete_pipeline(
+    # 1. Ingestion (HYBRID: typed tables + VARIANT player history)
+    ingestion_results = fpl_typed_pipeline(
         include_player_details=include_player_details,
-        include_live_gameweek=include_live_gameweek,
-        max_players=max_players,
+        max_players=max_players
     )
 
     # 2. Transformations (dbt)

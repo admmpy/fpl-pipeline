@@ -18,6 +18,25 @@ from config import OPTIMIZATION_CONFIG
 
 logger = logging.getLogger(__name__)
 
+
+def add_recommendation_metadata(
+    squad_records: List[Dict[str, Any]],
+    recommended_at: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """
+    Add recommendation metadata for historical tracking.
+    """
+    if not squad_records:
+        return squad_records
+
+    timestamp = recommended_at or pd.Timestamp.now().isoformat()
+
+    for record in squad_records:
+        record["recommended_at"] = timestamp
+        record["recommendation_key"] = f"{record.get('player_id')}_{timestamp}"
+
+    return squad_records
+
 class SquadOptimizer:
     """Optimizes FPL squad selection using integer programming."""
     
@@ -268,8 +287,9 @@ def optimize_squad_task(predictions: List[Dict[str, Any]], current_squad: Option
     
     # Add metadata
     for record in squad_records:
-        record['expected_points_5_gw'] = record['expected_points_next_gw'] * 5 # Simplified
-        record['recommendation_at'] = pd.Timestamp.now().isoformat()
+        record["expected_points_5_gw"] = record["expected_points_next_gw"] * 5
+
+    squad_records = add_recommendation_metadata(squad_records)
         
     logger.info(f"Optimization complete. Total Expected Points: {results['expected_points']:.2f}")
     
