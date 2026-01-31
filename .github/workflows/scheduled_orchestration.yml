@@ -1,0 +1,78 @@
+name: FPL Scheduled Orchestration
+
+on:
+  schedule:
+    - cron: "0 4 */3 * *"
+  workflow_dispatch:
+    inputs:
+      include_player_details:
+        description: "Include raw_element_summary ingestion"
+        type: boolean
+        default: true
+      allow_stale_data:
+        description: "Continue if dbt fails"
+        type: boolean
+        default: true
+      notify_on_success:
+        description: "Send Slack success notification"
+        type: boolean
+        default: false
+
+jobs:
+  orchestrate_pipeline:
+    runs-on: ubuntu-latest
+    env:
+      SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+      SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+      SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+      SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
+      SNOWFLAKE_SCHEMA: ${{ secrets.SNOWFLAKE_SCHEMA }}
+      SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      DBT_PROFILES_YML: ${{ secrets.DBT_PROFILES_YML }}
+      DBT_PROJECT_DIR: dbt_project
+      DBT_PROFILES_DIR: /home/runner/.dbt
+
+    steps:
+      - name: Checkout pipeline repo
+        uses: actions/checkout@v4
+
+      - name: Checkout dbt repo
+        uses: actions/checkout@v4
+        with:
+          repository: admmpy/fpl-dbt-sf
+          path: dbt_project
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install dbt-snowflake
+
+      - name: Configure dbt profiles
+        run: |
+          mkdir -p ~/.dbt
+          printf "%s" "$DBT_PROFILES_YML" > ~/.dbt/profiles.yml
+      
+      - name: Install dbt dependencies
+        run: dbt deps --project-dir dbt_project --profiles-dir ~/.dbt
+      
+      - name: Set run mode
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "INCLUDE_PLAYER_DETAILS=true" >> "$GITHUB_ENV"
+            echo "ALLOW_STALE_DATA=true" >> "$GITHUB_ENV"
+            echo "NOTIFY_ON_SUCCESS=false" >> "$GITHUB_ENV"
+          else
+            echo "INCLUDE_PLAYER_DETAILS=${{ inputs.include_player_details }}" >> "$GITHUB_ENV"
+            echo "ALLOW_STALE_DATA=${{ inputs.allow_stale_data }}" >> "$GITHUB_ENV"
+            echo "NOTIFY_ON_SUCCESS=${{ inputs.notify_on_success }}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Run full orchestration
+        run: python scripts/run_orchestration.py
