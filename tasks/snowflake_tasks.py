@@ -1,7 +1,7 @@
 """
 Snowflake loading tasks for FPL pipeline.
 """
-from utils.snowflake_client import create_typed_table, insert_typed_records
+from utils.snowflake_client import create_typed_table, insert_typed_records, insert_typed_records_append
 from config import TABLE_SCHEMAS
 from prefect import task, get_run_logger
 from typing import Dict, Any, List, Optional
@@ -233,5 +233,49 @@ def load_typed_records_to_snowflake(
         
     except Exception as e:
         logger.error(f"Failed to load records to {table_name}: {e}")
+        logger.warning(f"Continuing without Snowflake for {table_name}")
+        return {"total": len(records), "loaded": 0}
+
+
+@task
+def load_typed_records_append_to_snowflake(
+    table_name: str,
+    records: List[Dict[str, Any]]
+) -> Dict[str, int]:
+    """
+    Load typed records to Snowflake table using append-only INSERT.
+    
+    Unlike load_typed_records_to_snowflake (which uses MERGE), this task
+    always inserts new rows. Use for append-only historical tables like
+    players_gameweek_snapshot.
+    
+    Args:
+        table_name: Target table name
+        records: List of typed dictionaries (from transformation functions)
+        
+    Returns:
+        Dictionary with load statistics
+    """
+    logger = get_run_logger()
+    
+    # Check if Snowflake is configured
+    if get_snowflake_config() is None:
+        logger.warning(f"Snowflake not configured, skipping append to {table_name}")
+        return {"total": len(records), "loaded": 0}
+    
+    if not records:
+        logger.warning(f"No records to append to {table_name}")
+        return {"total": 0, "loaded": 0}
+    
+    try:
+        logger.info(f"Appending {len(records)} records to {table_name}...")
+        
+        count = insert_typed_records_append(table_name, records)
+        
+        logger.info(f"Successfully appended {count} records to {table_name}")
+        return {"total": len(records), "loaded": count}
+        
+    except Exception as e:
+        logger.error(f"Failed to append records to {table_name}: {e}")
         logger.warning(f"Continuing without Snowflake for {table_name}")
         return {"total": len(records), "loaded": 0}

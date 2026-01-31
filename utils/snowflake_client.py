@@ -311,3 +311,67 @@ def insert_typed_records(
             result = execute_merge(conn)
             conn.commit()
             return result
+
+
+def insert_typed_records_append(
+    table_name: str,
+    records: List[Dict[str, Any]],
+    connection: Optional[snowflake.connector.connection] = None
+) -> int:
+    """
+    Insert typed records into Snowflake table using append-only INSERT.
+    
+    Unlike insert_typed_records (which uses MERGE), this function always
+    inserts new rows without checking for duplicates. Use for append-only
+    historical tables like players_gameweek_snapshot.
+    
+    Args:
+        table_name: Target table name
+        records: List of dictionaries with typed data
+        connection: Optional existing connection
+        
+    Returns:
+        Number of records inserted
+    """
+    if not records:
+        return 0
+    
+    # Get column names from first record (exclude auto-increment columns)
+    all_columns = list(records[0].keys())
+    
+    # Filter out columns that should be auto-generated
+    auto_columns = {"snapshot_id", "ingestion_timestamp"}
+    columns = [col for col in all_columns if col not in auto_columns]
+    
+    columns_str = ", ".join(columns)
+    placeholders = ", ".join(["%s"] * len(columns))
+    
+    # Prepare data as tuples
+    data_tuples = [
+        tuple(record.get(col) for col in columns)
+        for record in records
+    ]
+    
+    insert_sql = f"""
+    INSERT INTO {table_name} ({columns_str})
+    VALUES ({placeholders})
+    """
+    
+    def execute_insert(conn):
+        cursor = conn.cursor()
+        try:
+            cursor.executemany(insert_sql, data_tuples)
+            rows_inserted = cursor.rowcount
+            cursor.close()
+            return rows_inserted
+        except Exception as e:
+            cursor.close()
+            raise e
+    
+    if connection:
+        return execute_insert(connection)
+    else:
+        with get_snowflake_connection() as conn:
+            result = execute_insert(conn)
+            conn.commit()
+            return result

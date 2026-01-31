@@ -307,6 +307,7 @@ from tasks.transformation_tasks import (
 from tasks.snowflake_tasks import (
     ensure_typed_table_exists,
     load_typed_records_to_snowflake,
+    load_typed_records_append_to_snowflake,
 )
 
 
@@ -342,7 +343,7 @@ def ingest_static_endpoints_typed() -> Dict[str, Any]:
         teams = parse_teams_from_bootstrap(bootstrap_response)
         gameweeks = parse_gameweeks_from_bootstrap(bootstrap_response)
         
-        # Load players
+        # Load players (current state - MERGE)
         logger.info("\nLoading players to Snowflake...")
         ensure_typed_table_exists("players")
         player_result = load_typed_records_to_snowflake("players", players)
@@ -350,6 +351,16 @@ def ingest_static_endpoints_typed() -> Dict[str, Any]:
             "status": "success",
             "records": player_result["loaded"],
             "total": player_result["total"]
+        }
+        
+        # Load players gameweek snapshot (historical - APPEND)
+        logger.info("\nAppending players gameweek snapshot to Snowflake...")
+        ensure_typed_table_exists("players_gameweek_snapshot")
+        snapshot_result = load_typed_records_append_to_snowflake("players_gameweek_snapshot", players)
+        results["players_gameweek_snapshot"] = {
+            "status": "success",
+            "records": snapshot_result["loaded"],
+            "total": snapshot_result["total"]
         }
         
         # Load teams
@@ -441,6 +452,7 @@ def fpl_typed_pipeline(
     if snowflake_config:
         logger.info("Snowflake configured - data will be loaded")
         logger.info("  - Typed tables (MERGE): players, teams, gameweeks, fixtures")
+        logger.info("  - Typed tables (APPEND): players_gameweek_snapshot")
         logger.info("  - VARIANT (INSERT): raw_element_summary")
     else:
         logger.info("Snowflake not configured - data will be fetched but not loaded")

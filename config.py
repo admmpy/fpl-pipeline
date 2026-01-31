@@ -138,6 +138,45 @@ PLAYER_SCHEMA = {
     "gameweek_fetched": "INTEGER",
 }
 
+# Player Gameweek Snapshot Schema - Append-only historical snapshots
+PLAYERS_GAMEWEEK_SNAPSHOT_SCHEMA = {
+    # Primary key (auto-increment for append-only)
+    "snapshot_id": "INTEGER AUTOINCREMENT NOT NULL",
+    
+    # Identity & Basic Info
+    "player_id": "INTEGER",
+    "web_name": "VARCHAR(100)",
+    "first_name": "VARCHAR(100)",
+    "second_name": "VARCHAR(100)",
+    "team_id": "INTEGER",
+    "position_id": "INTEGER",  # element_type in API (1=GK, 2=DEF, 3=MID, 4=FWD)
+    
+    # Cost & Value
+    "now_cost": "INTEGER",  # In 0.1m increments (e.g., 105 = 10.5m)
+    "selected_by_percent": "FLOAT",
+    "form": "FLOAT",
+    "value_season": "FLOAT",
+    "value_form": "FLOAT",
+    
+    # Core Stats
+    "total_points": "INTEGER",
+    "minutes": "INTEGER",
+    "goals_scored": "INTEGER",
+    "assists": "INTEGER",
+    "clean_sheets": "INTEGER",
+    "goals_conceded": "INTEGER",
+    "bonus": "INTEGER",
+    "bps": "INTEGER",
+    
+    # Status
+    "status": "VARCHAR(10)",
+    "chance_of_playing_next_round": "INTEGER",
+    
+    # Metadata
+    "gameweek_fetched": "INTEGER",
+    "ingestion_timestamp": "TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()",
+}
+
 # Team Schema
 TEAM_SCHEMA = {
     "team_id": "INTEGER NOT NULL",
@@ -209,6 +248,7 @@ RECOMMENDED_SQUAD_SCHEMA = {
 # Map table names to their schemas
 TABLE_SCHEMAS = {
     "players": PLAYER_SCHEMA,
+    "players_gameweek_snapshot": PLAYERS_GAMEWEEK_SNAPSHOT_SCHEMA,
     "teams": TEAM_SCHEMA,
     "gameweeks": GAMEWEEK_SCHEMA,
     "fixtures": FIXTURE_SCHEMA,
