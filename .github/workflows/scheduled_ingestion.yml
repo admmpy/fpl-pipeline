@@ -14,6 +14,7 @@ jobs:
   ingest_and_freshness:
     runs-on: ubuntu-latest
     env:
+      PYTHONPATH: ${{ github.workspace }}
       SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
       SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
       SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
