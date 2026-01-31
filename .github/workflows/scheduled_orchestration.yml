@@ -16,7 +16,7 @@ on:
       notify_on_success:
         description: "Send Slack success notification"
         type: boolean
-        default: false
+        default: true
 
 jobs:
   orchestrate_pipeline:
