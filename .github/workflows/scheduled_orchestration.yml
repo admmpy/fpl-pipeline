@@ -59,6 +59,9 @@ jobs:
           mkdir -p ~/.dbt
           printf "%s" "$DBT_PROFILES_YML" > ~/.dbt/profiles.yml
       
+      - name: Install dbt dependencies
+        run: dbt deps --project-dir dbt_project --profiles-dir ~/.dbt
+      
       - name: Set run mode
         run: |
           if [ "${{ github.event_name }}" = "schedule" ]; then
