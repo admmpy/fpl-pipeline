@@ -3,7 +3,6 @@ name: FPL Scheduled Ingestion
 on:
   schedule:
     - cron: "0 2 * * *"
-    - cron: "0 3 */3 * *"
   workflow_dispatch:
     inputs:
       include_player_details:
@@ -37,11 +36,7 @@ jobs:
       - name: Set run mode
         run: |
           if [ "${{ github.event_name }}" = "schedule" ]; then
-            if [ "${{ github.event.schedule }}" = "0 2 * * *" ]; then
-              echo "INCLUDE_PLAYER_DETAILS=false" >> "$GITHUB_ENV"
-            else
-              echo "INCLUDE_PLAYER_DETAILS=true" >> "$GITHUB_ENV"
-            fi
+            echo "INCLUDE_PLAYER_DETAILS=false" >> "$GITHUB_ENV"
           else
             echo "INCLUDE_PLAYER_DETAILS=${{ inputs.include_player_details }}" >> "$GITHUB_ENV"
           fi
