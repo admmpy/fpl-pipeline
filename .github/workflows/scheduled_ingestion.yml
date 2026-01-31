@@ -1,0 +1,71 @@
+name: FPL Scheduled Ingestion
+
+on:
+  schedule:
+    - cron: "0 2 * * *"
+    - cron: "0 3 */3 * *"
+  workflow_dispatch:
+    inputs:
+      include_player_details:
+        description: "Include raw_element_summary ingestion"
+        type: boolean
+        default: true
+
+jobs:
+  ingest_and_freshness:
+    runs-on: ubuntu-latest
+    env:
+      SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+      SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+      SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+      SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
+      SNOWFLAKE_SCHEMA: ${{ secrets.SNOWFLAKE_SCHEMA }}
+      SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      DBT_PROFILES_YML: ${{ secrets.DBT_PROFILES_YML }}
+
+    steps:
+      - name: Checkout pipeline repo
+        uses: actions/checkout@v4
+
+      - name: Checkout dbt repo
+        uses: actions/checkout@v4
+        with:
+          repository: admmpy/fpl-dbt-sf
+          path: dbt_project
+
+      - name: Set run mode
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            if [ "${{ github.event.schedule }}" = "0 2 * * *" ]; then
+              echo "INCLUDE_PLAYER_DETAILS=false" >> "$GITHUB_ENV"
+            else
+              echo "INCLUDE_PLAYER_DETAILS=true" >> "$GITHUB_ENV"
+            fi
+          else
+            echo "INCLUDE_PLAYER_DETAILS=${{ inputs.include_player_details }}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install dbt-snowflake
+
+      - name: Run ingestion
+        run: python scripts/run_ingestion.py
+
+      - name: Configure dbt profiles
+        run: |
+          mkdir -p ~/.dbt
+          printf "%s" "$DBT_PROFILES_YML" > ~/.dbt/profiles.yml
+
+      - name: Run dbt source freshness
+        run: |
+          dbt deps --project-dir dbt_project --profiles-dir ~/.dbt
+          dbt source freshness --project-dir dbt_project --profiles-dir ~/.dbt
