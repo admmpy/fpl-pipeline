@@ -8,6 +8,22 @@ from prefect import task, get_run_logger
 from utils.snowflake_client import get_snowflake_connection
 import os
 
+DEFAULT_SHRINKAGE_ALPHA = 0.3
+
+
+def apply_shrinkage(predictions: np.ndarray, league_mean: float, alpha: float) -> np.ndarray:
+    """
+    Shrink predictions toward the league mean.
+    """
+    return (1 - alpha) * predictions + alpha * league_mean
+
+
+def apply_calibration(predictions: np.ndarray, a: float, b: float) -> np.ndarray:
+    """
+    Apply linear calibration to predictions.
+    """
+    return a * predictions + b
+
 @task
 def fetch_training_data(table_name: str = "fct_ml_player_features") -> pd.DataFrame:
     """
@@ -111,7 +127,14 @@ def run_ml_inference(df: pd.DataFrame, model_path: str = "logs/model.bin") -> Li
         logger.info(f"Loading model from {model_path}...")
         import pickle
         with open(model_path, 'rb') as f:
-            model = pickle.load(f)
+            model_payload = pickle.load(f)
+        
+        if isinstance(model_payload, dict) and 'model' in model_payload:
+            model = model_payload['model']
+            metadata = model_payload.get('metadata', {})
+        else:
+            model = model_payload
+            metadata = {}
         
         # Define feature set (must match training)
         feature_cols = [
@@ -159,10 +182,26 @@ def run_ml_inference(df: pd.DataFrame, model_path: str = "logs/model.bin") -> Li
         # Make predictions
         X_inference = latest_stats[available_features].fillna(0)
         predictions_array = model.predict(X_inference)
-        
-        # Clip negative predictions to zero
         predictions_array = np.maximum(predictions_array, 0)
+
+        league_mean = metadata.get('league_mean')
+        shrinkage_alpha = metadata.get('shrinkage_alpha', DEFAULT_SHRINKAGE_ALPHA)
+        if league_mean is not None:
+            predictions_array = apply_shrinkage(predictions_array, league_mean, shrinkage_alpha)
+            logger.info(f"Applied shrinkage: alpha={shrinkage_alpha}, league_mean={league_mean:.2f}")
         
+        calibration = metadata.get('calibration')
+        if calibration:
+            predictions_array = apply_calibration(
+                predictions_array,
+                calibration.get('a', 1.0),
+                calibration.get('b', 0.0)
+            )
+            logger.info("Applied calibration to predictions.")
+        
+        # Clip negative predictions to zero after shrinkage/calibration
+        predictions_array = np.maximum(predictions_array, 0)
+
         latest_stats['expected_points_next_gw'] = predictions_array
         
         logger.info(f"Model predictions: min={predictions_array.min():.2f}, max={predictions_array.max():.2f}, mean={predictions_array.mean():.2f}")
