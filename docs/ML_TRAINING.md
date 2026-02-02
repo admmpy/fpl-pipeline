@@ -8,7 +8,8 @@ The ML pipeline:
 1. Fetches historical player features from `fct_ml_player_features` in Snowflake
 2. Engineers temporal features and creates training targets
 3. Trains an XGBoost regressor with time series cross-validation
-4. Saves the model to `model.bin` for inference
+4. Evaluates a temporal holdout set and reports bias
+5. Saves the model and metadata to `model.bin` for inference
 
 ## Training the Model
 
@@ -46,8 +47,8 @@ Engineering features...
 Feature engineering complete. 14250 samples remain after creating target.
 
 Training data shape: (14250, 45)
-Target range: [0.0, 24.0] points
-Target mean: 3.45 points
+Training target range: [0.0, 24.0] points
+Training target mean: 3.45 points
 
 Training XGBoost model...
 Running time series cross-validation...
@@ -70,6 +71,23 @@ Top 10 Most Important Features:
   form                                      0.0876
   ...
 
+============================================================
+HOLDOUT EVALUATION
+============================================================
+
+Holdout Metrics:
+  MAE:  2.45 points
+  RMSE: 3.80 points
+  Bias: -0.15 points (actual - predicted)
+
+Holdout bias by position_id:
+  1 | count=... pred=... actual=... mae=... bias=...
+  ...
+
+Holdout bias by minutes_band:
+  0-30 | count=... pred=... actual=... mae=... bias=...
+  ...
+
 ✅ Model saved to: logs/model.bin
 ✅ Metrics saved to: logs/model.metrics.txt
 ```
@@ -87,8 +105,9 @@ python scripts/run_once.py
 The `run_ml_inference` task will:
 1. Check if `model.bin` exists
 2. Load the trained model
-3. Generate predictions for all players
-4. Output predictions to `recommended_squad` table
+3. Apply shrinkage (and optional calibration) using saved metadata
+4. Generate predictions for all players
+5. Output predictions to `recommended_squad` table
 
 ### Fallback Behaviour
 
@@ -141,15 +160,25 @@ predicted_points = 0.7 * rolling_avg + 1.5 * z_score + 2.0
 ## Model Architecture
 
 - **Algorithm:** XGBoost Regressor
-- **Objective:** Squared error regression
+- **Objective:** Quantile regression (upper quantile)
 - **Evaluation Metric:** Mean Absolute Error (MAE)
 - **Cross-Validation:** Time Series Split (5 folds)
 - **Hyperparameters:**
   - `n_estimators=200`
-  - `max_depth=6`
+  - `max_depth=5`
   - `learning_rate=0.1`
   - `subsample=0.8`
   - `colsample_bytree=0.8`
+  - `quantile_alpha=0.8`
+  - `reg_alpha=0.1`
+  - `reg_lambda=1.0`
+
+### Bias Control
+
+- **Shrinkage toward league mean** is applied at inference using metadata saved with the model.
+- **Calibration** is optional and only applied if coefficients are saved.
+ 
+Current defaults: `shrinkage_alpha=0.3`, `calibration=None` (disabled).
 
 ## Performance Expectations
 
@@ -187,8 +216,8 @@ python scripts/run_once.py
 ## Monitoring
 
 Check `model.metrics.txt` after training:
-- Monitor MAE trend over time
-- Compare to baseline heuristic
+- Monitor train and holdout MAE trend over time
+- Track holdout bias (actual - predicted)
 - Review feature importance for drift
 
 Compare predictions to actuals in dbt:
