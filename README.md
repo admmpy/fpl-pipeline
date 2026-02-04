@@ -141,26 +141,12 @@ Edit `config.py` and add to `STATIC_ENDPOINTS` or `DYNAMIC_ENDPOINTS`. Then crea
 
 ## Scheduling
 
-### Prefect Deployment
+### GitHub Actions (Scheduled Runs)
 
-```bash
-# Create a deployment
-prefect deployment build flows/fpl_ingestion.py:fpl_typed_pipeline \
-    --name "FPL Weekly Ingestion" \
-    --cron "0 2 * * 4"  # Every Thursday at 2 AM
+Scheduling is handled by GitHub Actions workflows:
 
-# Apply and start worker
-prefect deployment apply fpl_typed_pipeline-deployment.yaml
-prefect worker start --pool default
-```
-
-### Weekly Orchestration (ML + Optimisation)
-
-The orchestration flow runs ingestion, dbt, ML inference, and squad optimisation:
-
-```bash
-python scripts/deploy.py
-```
+- `scheduled_ingestion.yml` runs `run_ingestion.py`
+- `scheduled_orchestration.yml` runs `run_orchestration.py`
 
 To run a one-off test of the full pipeline:
 

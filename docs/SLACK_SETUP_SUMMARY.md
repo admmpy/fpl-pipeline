@@ -146,15 +146,8 @@ python scripts/run_once.py
 
 ### Production Deployment
 
-When deploying with Prefect:
-
-```bash
-# Deploy with schedule
-python scripts/deploy.py
-
-# Webhook URL will be read from .env automatically
-# Failures will be reported to Slack via the hooks
-```
+In production, scheduled runs are triggered by GitHub Actions workflows.
+The Slack webhook URL is read from `.env` automatically, and failures are reported via the hooks.
 
 ### Custom Notifications
 
