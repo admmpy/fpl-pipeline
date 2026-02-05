@@ -8,6 +8,7 @@ This script:
 4. Evaluates model performance
 5. Saves the trained model to disk
 """
+import logging
 import pandas as pd
 import numpy as np
 import xgboost as xgb
@@ -19,17 +20,25 @@ from typing import Dict, Tuple
 import sys
 import os
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
 # Add parent directory to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils.snowflake_client import get_snowflake_connection
 from config import get_snowflake_config
 
 HOLDOUT_GAMEWEEKS = 5
-SHRINKAGE_ALPHA = 0.3
+SHRINKAGE_ALPHA = 0.0
 REG_ALPHA = 0.1
 REG_LAMBDA = 1.0
 MAX_DEPTH = 5
 ENABLE_CALIBRATION = True
+CALIBRATION_STRENGTH = 0.8
 FEATURES_TO_SCALE = ['total_points', 'minutes_played', 'ict_index']
 
 
@@ -40,7 +49,7 @@ def fetch_training_data() -> pd.DataFrame:
     Returns:
         DataFrame with player features and target variable (total_points)
     """
-    print("Fetching training data from Snowflake...")
+    logger.info("Fetching training data from Snowflake...")
     
     if get_snowflake_config() is None:
         raise ValueError("Snowflake configuration not found. Cannot fetch training data.")
@@ -62,8 +71,8 @@ def fetch_training_data() -> pd.DataFrame:
     # Standardise column names to lowercase
     df.columns = [c.lower() for c in df.columns]
     
-    print(f"Fetched {len(df)} training samples across {df['gameweek_id'].nunique()} gameweeks")
-    print(f"Players: {df['player_id'].nunique()}, Date range: GW{df['gameweek_id'].min()}-{df['gameweek_id'].max()}")
+    logger.info(f"Fetched {len(df)} training samples across {df['gameweek_id'].nunique()} gameweeks")
+    logger.info(f"Players: {df['player_id'].nunique()}, Date range: GW{df['gameweek_id'].min()}-{df['gameweek_id'].max()}")
     
     return df
 
@@ -78,7 +87,7 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     Returns:
         DataFrame with engineered features (excluding z-scores)
     """
-    print("\nEngineering features...")
+    logger.info("Engineering features...")
     
     df = df.copy()
     
@@ -101,7 +110,7 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     # 5. Drop rows without target (last GW for each player)
     df = df.dropna(subset=['target_next_gw_points'])
     
-    print(f"Feature engineering complete. {len(df)} samples remain after creating target.")
+    logger.info(f"Feature engineering complete. {len(df)} samples remain after creating target.")
     
     return df
 
@@ -118,9 +127,10 @@ def compute_global_stats(df: pd.DataFrame) -> Dict[str, Dict[str, float]]:
     """
     global_stats: Dict[str, Dict[str, float]] = {}
     for feature in FEATURES_TO_SCALE:
+        raw_std = float(df[feature].std())
         global_stats[feature] = {
             'mean': float(df[feature].mean()),
-            'std': float(df[feature].std() or 1.0),
+            'std': raw_std if raw_std > 0 else 1.0,
         }
     return global_stats
 
@@ -142,7 +152,7 @@ def add_z_scores(
     for feature in FEATURES_TO_SCALE:
         mean_val = global_stats[feature]['mean']
         std_val = global_stats[feature]['std']
-        df[f'{feature}_z_score'] = (df[feature] - mean_val) / (std_val or 1.0)
+        df[f'{feature}_z_score'] = (df[feature] - mean_val) / std_val
         df[f'{feature}_z_score'] = df[f'{feature}_z_score'].fillna(0)
     return df
 
@@ -187,13 +197,26 @@ def apply_shrinkage(predictions: np.ndarray, league_mean: float, alpha: float) -
 
 def fit_calibration(y_true: np.ndarray, y_pred: np.ndarray) -> Tuple[float, float]:
     """
-    Fit a linear calibration model: actual ≈ a * predicted + b.
+    Fit a linear calibration model using mean/std matching.
     """
-    if np.std(y_pred) == 0:
+    pred_std = float(np.std(y_pred))
+    true_std = float(np.std(y_true))
+    if pred_std == 0:
         return 1.0, 0.0
-    
-    a, b = np.polyfit(y_pred, y_true, 1)
+
+    a = true_std / pred_std
+    b = float(np.mean(y_true)) - a * float(np.mean(y_pred))
     return float(a), float(b)
+
+
+def blend_calibration(a: float, b: float, strength: float) -> Tuple[float, float]:
+    """
+    Blend calibration toward no-op (a=1, b=0) to avoid over-correction.
+    """
+    strength = max(0.0, min(1.0, strength))
+    blended_a = 1.0 + strength * (a - 1.0)
+    blended_b = strength * b
+    return float(blended_a), float(blended_b)
 
 
 def apply_calibration(predictions: np.ndarray, a: float, b: float) -> np.ndarray:
@@ -221,9 +244,9 @@ def print_group_bias(df: pd.DataFrame, y_true: np.ndarray, y_pred: np.ndarray, g
         mean_error_bias=('error_bias', 'mean')
     ).reset_index()
     
-    print(f"\n{label} bias by {group_col}:")
+    logger.info(f"{label} bias by {group_col}:")
     for _, row in summary.iterrows():
-        print(
+        logger.info(
             f"  {row[group_col]} | count={int(row['player_count'])} "
             f"pred={row['avg_predicted_points']:.2f} "
             f"actual={row['avg_actual_points']:.2f} "
@@ -314,7 +337,7 @@ def train_xgboost_model(X: pd.DataFrame, y: pd.Series) -> xgb.XGBRegressor:
     Returns:
         Trained XGBoost model
     """
-    print("\nTraining XGBoost model...")
+    logger.info("Training XGBoost model...")
     
     # Define model with sensible hyperparameters
     model = xgb.XGBRegressor(
@@ -334,7 +357,7 @@ def train_xgboost_model(X: pd.DataFrame, y: pd.Series) -> xgb.XGBRegressor:
     # Time series cross-validation (respects temporal order)
     tscv = TimeSeriesSplit(n_splits=5)
     
-    print("Running time series cross-validation...")
+    logger.info("Running time series cross-validation...")
     cv_scores = cross_val_score(
         model, X, y, 
         cv=tscv, 
@@ -342,10 +365,10 @@ def train_xgboost_model(X: pd.DataFrame, y: pd.Series) -> xgb.XGBRegressor:
         n_jobs=-1
     )
     
-    print(f"Cross-validation MAE: {-cv_scores.mean():.3f} (+/- {cv_scores.std():.3f})")
+    logger.info(f"Cross-validation MAE: {-cv_scores.mean():.3f} (+/- {cv_scores.std():.3f})")
     
     # Train final model on all data
-    print("Training final model on full dataset...")
+    logger.info("Training final model on full dataset...")
     model.fit(X, y)
     
     return model
@@ -360,9 +383,9 @@ def evaluate_model(model: xgb.XGBRegressor, X: pd.DataFrame, y: pd.Series):
         X: Feature matrix
         y: True target values
     """
-    print("\n" + "="*60)
-    print("MODEL EVALUATION")
-    print("="*60)
+    logger.info("=" * 60)
+    logger.info("MODEL EVALUATION")
+    logger.info("=" * 60)
     
     # Generate predictions
     y_pred = model.predict(X)
@@ -373,21 +396,21 @@ def evaluate_model(model: xgb.XGBRegressor, X: pd.DataFrame, y: pd.Series):
     r2 = r2_score(y, y_pred)
     bias = float((y - y_pred).mean())
     
-    print(f"\nOverall Metrics:")
-    print(f"  MAE:  {mae:.3f} points")
-    print(f"  RMSE: {rmse:.3f} points")
-    print(f"  R²:   {r2:.3f}")
-    print(f"  Bias: {bias:.3f} points (actual - predicted)")
+    logger.info("Overall Metrics:")
+    logger.info(f"  MAE:  {mae:.3f} points")
+    logger.info(f"  RMSE: {rmse:.3f} points")
+    logger.info(f"  R2:   {r2:.3f}")
+    logger.info(f"  Bias: {bias:.3f} points (actual - predicted)")
     
     # Feature importance
-    print(f"\nTop 10 Most Important Features:")
+    logger.info("Top 10 Most Important Features:")
     feature_importance = pd.DataFrame({
         'feature': X.columns,
         'importance': model.feature_importances_
     }).sort_values('importance', ascending=False)
-    
+
     for idx, row in feature_importance.head(10).iterrows():
-        print(f"  {row['feature']:40s} {row['importance']:.4f}")
+        logger.info(f"  {row['feature']:40s} {row['importance']:.4f}")
     
     return {
         'mae': mae,
@@ -431,7 +454,7 @@ def save_model(model: xgb.XGBRegressor, metrics: dict, output_path: str = "logs/
             f
         )
     
-    print(f"\n✅ Model saved to: {output_path}")
+    logger.info(f"Model saved to: {output_path}")
     
     # Save metrics
     metrics_path = Path(output_path).with_suffix('.metrics.txt')
@@ -460,16 +483,16 @@ def save_model(model: xgb.XGBRegressor, metrics: dict, output_path: str = "logs/
         for idx, row in metrics['feature_importance'].head(10).iterrows():
             f.write(f"  {row['feature']:40s} {row['importance']:.4f}\n")
     
-    print(f"✅ Metrics saved to: {metrics_path}")
+    logger.info(f"Metrics saved to: {metrics_path}")
 
 
 def main():
     """
     Main training pipeline.
     """
-    print("="*60)
-    print("FPL XGBOOST MODEL TRAINING")
-    print("="*60)
+    logger.info("=" * 60)
+    logger.info("FPL XGBOOST MODEL TRAINING")
+    logger.info("=" * 60)
     
     # 1. Fetch data
     df = fetch_training_data()
@@ -493,11 +516,11 @@ def main():
     missing_features = [f for f in features if f not in train_df.columns]
     
     if missing_features:
-        print(f"\n⚠️  Warning: {len(missing_features)} features not found in data:")
+        logger.warning(f"{len(missing_features)} features not found in data:")
         for f in missing_features[:5]:  # Show first 5
-            print(f"  - {f}")
+            logger.warning(f"  - {f}")
         if len(missing_features) > 5:
-            print(f"  ... and {len(missing_features) - 5} more")
+            logger.warning(f"  ... and {len(missing_features) - 5} more")
     
     if missing_features:
         for feature in missing_features:
@@ -511,10 +534,10 @@ def main():
     X_holdout = holdout_df[available_features]
     y_holdout = holdout_df['target_next_gw_points']
     
-    print(f"\nTraining data shape: {X_train.shape}")
-    print(f"Training target shape: {y_train.shape}")
-    print(f"Training target range: [{y_train.min():.1f}, {y_train.max():.1f}] points")
-    print(f"Training target mean: {y_train.mean():.2f} points")
+    logger.info(f"Training data shape: {X_train.shape}")
+    logger.info(f"Training target shape: {y_train.shape}")
+    logger.info(f"Training target range: [{y_train.min():.1f}, {y_train.max():.1f}] points")
+    logger.info(f"Training target mean: {y_train.mean():.2f} points")
     
     # 6. Train model
     model = train_xgboost_model(X_train, y_train)
@@ -530,6 +553,7 @@ def main():
     calibration = None
     if ENABLE_CALIBRATION:
         a, b = fit_calibration(y_holdout.to_numpy(), holdout_pred)
+        a, b = blend_calibration(a, b, CALIBRATION_STRENGTH)
         holdout_pred = apply_calibration(holdout_pred, a, b)
         calibration = {'a': a, 'b': b}
     
@@ -554,13 +578,13 @@ def main():
                 }
             )
     
-    print("\n" + "="*60)
-    print("HOLDOUT EVALUATION")
-    print("="*60)
-    print(f"\nHoldout Metrics:")
-    print(f"  MAE:  {holdout_mae:.3f} points")
-    print(f"  RMSE: {holdout_rmse:.3f} points")
-    print(f"  Bias: {holdout_bias:.3f} points (actual - predicted)")
+    logger.info("=" * 60)
+    logger.info("HOLDOUT EVALUATION")
+    logger.info("=" * 60)
+    logger.info("Holdout Metrics:")
+    logger.info(f"  MAE:  {holdout_mae:.3f} points")
+    logger.info(f"  RMSE: {holdout_rmse:.3f} points")
+    logger.info(f"  Bias: {holdout_bias:.3f} points (actual - predicted)")
     
     holdout_context = holdout_df[['player_id', 'position_id', 'minutes_played']].copy()
     holdout_context['minutes_band'] = pd.cut(
@@ -608,13 +632,13 @@ def main():
     # 9. Save
     save_model(model, metrics, output_path="logs/model.bin")
     
-    print("\n" + "="*60)
-    print("TRAINING COMPLETE!")
-    print("="*60)
-    print("\nNext steps:")
-    print("  1. Review model metrics above")
-    print("  2. Run pipeline: python run_once.py")
-    print("  3. Check predictions in Snowflake: SELECT * FROM recommended_squad")
+    logger.info("=" * 60)
+    logger.info("TRAINING COMPLETE!")
+    logger.info("=" * 60)
+    logger.info("Next steps:")
+    logger.info("  1. Review model metrics above")
+    logger.info("  2. Run pipeline: python run_once.py")
+    logger.info("  3. Check predictions in Snowflake: SELECT * FROM recommended_squad")
 
 
 if __name__ == "__main__":
