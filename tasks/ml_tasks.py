@@ -4,11 +4,24 @@ Tasks for ML inference and data preparation.
 from typing import Dict, Any, List, Optional
 import pandas as pd
 import numpy as np
+import logging
+import pickle
 from prefect import task, get_run_logger
+from prefect.exceptions import MissingContextError
 from utils.snowflake_client import get_snowflake_connection
 import os
 
-DEFAULT_SHRINKAGE_ALPHA = 0.3
+DEFAULT_SHRINKAGE_ALPHA = 0.0
+
+
+def get_logger():
+    """
+    Return a Prefect run logger when available, otherwise a standard logger.
+    """
+    try:
+        return get_run_logger()
+    except MissingContextError:
+        return logging.getLogger(__name__)
 
 
 def apply_shrinkage(predictions: np.ndarray, league_mean: float, alpha: float) -> np.ndarray:
@@ -24,12 +37,31 @@ def apply_calibration(predictions: np.ndarray, a: float, b: float) -> np.ndarray
     """
     return a * predictions + b
 
+
+def apply_global_z_scores(
+    df: pd.DataFrame,
+    stats: Dict[str, Dict[str, float]],
+    features_to_scale: List[str]
+) -> pd.DataFrame:
+    """
+    Apply global z-score normalization using training statistics.
+    """
+    df = df.copy()
+    for feature in features_to_scale:
+        if feature in df.columns and feature in stats:
+            mean_val = stats[feature].get('mean', 0.0)
+            raw_std = stats[feature].get('std', 1.0)
+            std_val = raw_std if raw_std > 0 else 1.0
+            df[f'{feature}_z_score'] = (df[feature] - mean_val) / std_val
+            df[f'{feature}_z_score'] = df[f'{feature}_z_score'].fillna(0)
+    return df
+
 @task
 def fetch_training_data(table_name: str = "fct_ml_player_features") -> pd.DataFrame:
     """
     Fetch the denormalized feature table from Snowflake for training/inference.
     """
-    logger = get_run_logger()
+    logger = get_logger()
     logger.info(f"Fetching features from {table_name}...")
     
     query = f"""
@@ -53,38 +85,14 @@ def fetch_training_data(table_name: str = "fct_ml_player_features") -> pd.DataFr
 @task
 def prepare_inference_data(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Apply Z-score normalization and handle the Cold Start problem.
+    Prepare inference data and handle the Cold Start problem.
     
     Logic:
-    1. Calculate Z-scores for key metrics per Gameweek (to handle Feature Drift).
-    2. Filter for players with minutes_played > 0 to avoid selection bias.
-    3. Drop GW 1-3 to ensure rolling averages are more stable.
+    1. Drop GW 1-3 to ensure rolling averages are more stable.
     """
-    logger = get_run_logger()
-    
-    # 1. Z-Score Normalization (Relative Form)
-    # We do this before dropping GW 1-3 to use the full context for normalization
-    # but we only use active players to calculate the mean/std
-    features_to_scale = ['total_points', 'minutes_played', 'ict_index']
-    
-    for feature in features_to_scale:
-        if feature in df.columns:
-            # Only include players with minutes > 0 to avoid selection bias in the baseline
-            active_players = df[df['minutes_played'] > 0]
-            
-            gw_stats = active_players.groupby('gameweek_id')[feature].agg(['mean', 'std']).reset_index()
-            gw_stats.columns = ['gameweek_id', f'{feature}_gw_mean', f'{feature}_gw_std']
-            
-            df = df.merge(gw_stats, on='gameweek_id', how='left')
-            
-            # Calculate Z-score (standardizing relative to the gameweek)
-            df[f'{feature}_z_score'] = (df[feature] - df[f'{feature}_gw_mean']) / df[f'{feature}_gw_std'].replace(0, np.nan)
-            df[f'{feature}_z_score'] = df[f'{feature}_z_score'].fillna(0)
-            
-            # Drop the helper columns
-            df = df.drop(columns=[f'{feature}_gw_mean', f'{feature}_gw_std'])
+    logger = get_logger()
 
-    # 2. Cold Start: Drop GW 1-3
+    # Cold Start: Drop GW 1-3
     logger.info("Dropping Gameweeks 1-3 to handle Cold Start problem.")
     df_clean = df[df['gameweek_id'] > 3].copy()
     
@@ -103,7 +111,7 @@ def run_ml_inference(df: pd.DataFrame, model_path: str = "logs/model.bin") -> Li
     Returns:
         List of dictionaries with player predictions for the next gameweek.
     """
-    logger = get_run_logger()
+    logger = get_logger()
     
     # Identify the target gameweek (max in data + 1)
     current_gw = df['gameweek_id'].max()
@@ -125,19 +133,26 @@ def run_ml_inference(df: pd.DataFrame, model_path: str = "logs/model.bin") -> Li
     else:
         # Load trained model
         logger.info(f"Loading model from {model_path}...")
-        import pickle
-        with open(model_path, 'rb') as f:
-            model_payload = pickle.load(f)
-        
+        try:
+            with open(model_path, 'rb') as f:
+                model_payload = pickle.load(f)
+        except Exception as exc:
+            logger.error(f"Failed to load model from {model_path}: {exc}")
+            return []
+
         if isinstance(model_payload, dict) and 'model' in model_payload:
             model = model_payload['model']
             metadata = model_payload.get('metadata', {})
         else:
             model = model_payload
             metadata = {}
+
+        if not hasattr(model, 'predict'):
+            logger.error("Loaded model object does not have a predict method")
+            return []
         
-        # Define feature set (must match training)
-        feature_cols = [
+        # Define default feature set (overridden by model metadata if present)
+        default_feature_cols = [
             'total_points', 'minutes_played', 'goals_scored', 'assists', 
             'clean_sheets', 'goals_conceded', 'bonus', 'ict_index', 
             'influence', 'creativity', 'threat',
@@ -152,9 +167,9 @@ def run_ml_inference(df: pd.DataFrame, model_path: str = "logs/model.bin") -> Li
             'team_position', 'opponent_team_position', 'team_position_difference',
             'form', 'now_cost',
             'total_points_z_score', 'minutes_played_z_score', 'ict_index_z_score',
-            'is_gk', 'is_def', 'is_mid', 'is_fwd',
-            'is_home'
+            'is_gk', 'is_def', 'is_mid', 'is_fwd'
         ]
+        feature_cols = metadata.get('feature_cols') or default_feature_cols
         
         # Engineer additional features needed for inference
         # Position encoding
@@ -162,9 +177,11 @@ def run_ml_inference(df: pd.DataFrame, model_path: str = "logs/model.bin") -> Li
         df['is_def'] = (df['position_id'] == 2).astype(int)
         df['is_mid'] = (df['position_id'] == 3).astype(int)
         df['is_fwd'] = (df['position_id'] == 4).astype(int)
-        
-        # Home advantage (assume neutral for future prediction)
-        df['is_home'] = 0
+
+        # Apply global z-scores using training stats, if available
+        zscore_stats = metadata.get('zscore_stats', {})
+        if zscore_stats:
+            df = apply_global_z_scores(df, zscore_stats, ['total_points', 'minutes_played', 'ict_index'])
         
         # Filter to only features that exist in the dataframe
         available_features = [f for f in feature_cols if f in df.columns]
@@ -181,7 +198,11 @@ def run_ml_inference(df: pd.DataFrame, model_path: str = "logs/model.bin") -> Li
         
         # Make predictions
         X_inference = latest_stats[available_features].fillna(0)
-        predictions_array = model.predict(X_inference)
+        try:
+            predictions_array = model.predict(X_inference)
+        except Exception as exc:
+            logger.error(f"model.predict() failed: {exc}")
+            return []
         predictions_array = np.maximum(predictions_array, 0)
 
         league_mean = metadata.get('league_mean')
@@ -203,14 +224,34 @@ def run_ml_inference(df: pd.DataFrame, model_path: str = "logs/model.bin") -> Li
         predictions_array = np.maximum(predictions_array, 0)
 
         latest_stats['expected_points_next_gw'] = predictions_array
+
+        # Apply per-position caps if available
+        position_caps = metadata.get('position_caps', {})
+        if position_caps:
+            cap_values = latest_stats['position_id'].map(position_caps).fillna(np.inf).to_numpy()
+            before_clip = latest_stats['expected_points_next_gw'].to_numpy()
+            latest_stats['expected_points_next_gw'] = np.minimum(before_clip, cap_values)
+            clipped = (before_clip > cap_values).sum()
+            if clipped:
+                logger.info(f"Applied position caps: {clipped} predictions clipped")
         
-        logger.info(f"Model predictions: min={predictions_array.min():.2f}, max={predictions_array.max():.2f}, mean={predictions_array.mean():.2f}")
+        clipped_stats = latest_stats['expected_points_next_gw']
+        logger.info(
+            "Model predictions: "
+            f"min={clipped_stats.min():.2f}, "
+            f"max={clipped_stats.max():.2f}, "
+            f"mean={clipped_stats.mean():.2f}"
+        )
         
         df = latest_stats
     
     # Get only the latest available stats for each player to predict the next GW
     latest_stats = df.sort_values('gameweek_id').groupby('player_id').tail(1)
-    
+
+    if latest_stats.empty:
+        logger.warning("DataFrame is empty after filtering — returning no predictions")
+        return []
+
     predictions = []
     for _, row in latest_stats.iterrows():
         predictions.append({
