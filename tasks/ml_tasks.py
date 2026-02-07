@@ -56,6 +56,47 @@ def apply_global_z_scores(
             df[f'{feature}_z_score'] = df[f'{feature}_z_score'].fillna(0)
     return df
 
+
+def ensure_z_score_columns(
+    df: pd.DataFrame,
+    features_to_scale: List[str],
+    stats: Optional[Dict[str, Dict[str, float]]] = None,
+    logger: Optional[logging.Logger] = None
+) -> pd.DataFrame:
+    """
+    Ensure z-score columns exist for requested features, using training stats when available.
+    """
+    logger = logger or logging.getLogger(__name__)
+    df = df.copy()
+
+    if stats:
+        df = apply_global_z_scores(df, stats, features_to_scale)
+        for feature in features_to_scale:
+            z_col = f'{feature}_z_score'
+            if z_col not in df.columns:
+                if feature in df.columns:
+                    logger.warning(f"Missing stats for {feature}; defaulting {z_col} to 0")
+                else:
+                    logger.warning(f"Missing {feature} and {z_col}; defaulting {z_col} to 0")
+                df[z_col] = 0.0
+        return df
+
+    for feature in features_to_scale:
+        z_col = f'{feature}_z_score'
+        if z_col in df.columns:
+            continue
+        if feature in df.columns:
+            mean_val = df[feature].mean()
+            std_val = df[feature].std()
+            std_val = std_val if std_val and std_val > 0 else 1.0
+            df[z_col] = ((df[feature] - mean_val) / std_val).fillna(0)
+            logger.warning(f"Missing {z_col}; computed from {feature}")
+        else:
+            logger.warning(f"Missing {feature} and {z_col}; defaulting {z_col} to 0")
+            df[z_col] = 0.0
+
+    return df
+
 @task
 def fetch_training_data(table_name: str = "fct_ml_player_features") -> pd.DataFrame:
     """
@@ -125,9 +166,23 @@ def run_ml_inference(df: pd.DataFrame, model_path: str = "logs/model.bin") -> Li
         logger.warning("Falling back to heuristic predictions. Run 'python train_model.py' to create model.")
         
         # Fallback: heuristic prediction
+        if 'three_week_players_roll_avg_points' in df.columns:
+            roll_avg = df['three_week_players_roll_avg_points'].fillna(2.0)
+        else:
+            logger.warning("Missing three_week_players_roll_avg_points; defaulting to 2.0")
+            roll_avg = pd.Series(2.0, index=df.index)
+
+        df = ensure_z_score_columns(
+            df,
+            ['total_points'],
+            stats=None,
+            logger=logger
+        )
+        total_points_z = df['total_points_z_score'].fillna(0)
+
         df['expected_points_next_gw'] = (
-            df['three_week_players_roll_avg_points'].fillna(2.0) * 0.7 + 
-            df['total_points_z_score'].fillna(0) * 1.5 + 
+            roll_avg * 0.7 +
+            total_points_z * 1.5 +
             2.0
         ).clip(lower=0)
     else:
@@ -179,9 +234,14 @@ def run_ml_inference(df: pd.DataFrame, model_path: str = "logs/model.bin") -> Li
         df['is_fwd'] = (df['position_id'] == 4).astype(int)
 
         # Apply global z-scores using training stats, if available
+        zscore_features = ['total_points', 'minutes_played', 'ict_index']
         zscore_stats = metadata.get('zscore_stats', {})
-        if zscore_stats:
-            df = apply_global_z_scores(df, zscore_stats, ['total_points', 'minutes_played', 'ict_index'])
+        df = ensure_z_score_columns(
+            df,
+            zscore_features,
+            stats=zscore_stats if zscore_stats else None,
+            logger=logger
+        )
         
         # Filter to only features that exist in the dataframe
         available_features = [f for f in feature_cols if f in df.columns]

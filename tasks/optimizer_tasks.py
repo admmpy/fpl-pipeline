@@ -9,6 +9,7 @@ import cvxpy as cp
 import numpy as np
 import pandas as pd
 from prefect import task, get_run_logger
+from prefect.exceptions import MissingContextError
 import os
 import sys
 
@@ -17,6 +18,16 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import OPTIMIZATION_CONFIG
 
 logger = logging.getLogger(__name__)
+
+
+def get_logger():
+    """
+    Return a Prefect run logger when available, otherwise a standard logger.
+    """
+    try:
+        return get_run_logger()
+    except MissingContextError:
+        return logging.getLogger(__name__)
 
 
 def add_recommendation_metadata(
@@ -269,7 +280,7 @@ def optimize_squad_task(predictions: List[Dict[str, Any]], current_squad: Option
     """
     Prefect task wrapper for the SquadOptimizer.
     """
-    logger = get_run_logger()
+    logger = get_logger()
     
     df = pd.DataFrame(predictions)
     

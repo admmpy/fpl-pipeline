@@ -22,6 +22,8 @@ from tasks.ml_tasks import (
     apply_shrinkage as infer_apply_shrinkage,
     apply_calibration as infer_apply_calibration,
     apply_global_z_scores,
+    ensure_z_score_columns,
+    run_ml_inference,
 )
 
 
@@ -189,6 +191,69 @@ class TestApplyGlobalZScores:
         stats = {"total_points": {"mean": 15.0, "std": 5.0}}
         apply_global_z_scores(df, stats, ["total_points"])
         assert "total_points_z_score" not in df.columns
+
+
+# ---------------------------------------------------------------------------
+# ensure_z_score_columns (tasks/ml_tasks.py)
+# ---------------------------------------------------------------------------
+
+class TestEnsureZScoreColumns:
+    def test_no_stats_computes_from_df(self):
+        df = pd.DataFrame({"total_points": [10.0, 20.0]})
+        result = ensure_z_score_columns(df, ["total_points"], stats=None)
+        expected = np.array([-1.0, 1.0])
+        np.testing.assert_array_almost_equal(
+            result["total_points_z_score"].to_numpy(), expected
+        )
+
+    def test_missing_feature_defaults_zero(self):
+        df = pd.DataFrame({"other": [1.0, 2.0]})
+        result = ensure_z_score_columns(df, ["total_points"], stats=None)
+        assert (result["total_points_z_score"] == 0.0).all()
+
+    def test_with_stats_uses_stats(self):
+        df = pd.DataFrame({"total_points": [10.0, 20.0]})
+        stats = {"total_points": {"mean": 15.0, "std": 5.0}}
+        result = ensure_z_score_columns(df, ["total_points"], stats=stats)
+        expected = np.array([-1.0, 1.0])
+        np.testing.assert_array_almost_equal(
+            result["total_points_z_score"].to_numpy(), expected
+        )
+
+
+# ---------------------------------------------------------------------------
+# run_ml_inference (fallback path)
+# ---------------------------------------------------------------------------
+
+class TestRunMlInferenceFallback:
+    def test_missing_z_score_uses_total_points(self):
+        df = pd.DataFrame({
+            "gameweek_id": [10],
+            "player_id": [1],
+            "web_name": ["A"],
+            "position_id": [2],
+            "team_id": [1],
+            "now_cost": [5.0],
+            "three_week_players_roll_avg_points": [4.0],
+            "total_points": [10.0],
+        })
+        predictions = run_ml_inference.fn(df, model_path="does-not-exist.bin")
+        assert len(predictions) == 1
+        assert predictions[0]["expected_points_next_gw"] == pytest.approx(4.0 * 0.7 + 2.0)
+
+    def test_missing_total_points_defaults_zero_z(self):
+        df = pd.DataFrame({
+            "gameweek_id": [10],
+            "player_id": [2],
+            "web_name": ["B"],
+            "position_id": [3],
+            "team_id": [2],
+            "now_cost": [6.0],
+            "three_week_players_roll_avg_points": [3.0],
+        })
+        predictions = run_ml_inference.fn(df, model_path="does-not-exist.bin")
+        assert len(predictions) == 1
+        assert predictions[0]["expected_points_next_gw"] == pytest.approx(3.0 * 0.7 + 2.0)
 
 
 # ---------------------------------------------------------------------------
