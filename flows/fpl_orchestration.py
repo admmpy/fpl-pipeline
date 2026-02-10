@@ -240,6 +240,31 @@ def fpl_weekly_orchestration(
             logger.error(f"Loading recommendations failed: {e}")
             raise
 
+        # 5b. Refresh reporting models after recommendations load
+        try:
+            logger.info("Step 5b: Refreshing reporting models...")
+            dbt_post_result = run_dbt_command(
+                command=[
+                    "dbt",
+                    "build",
+                    "--select",
+                    "fct_model_analysis rprt_squad_performance_comparison rprt_squad_performance_summary",
+                ],
+                project_dir=dbt_project_dir,
+                profiles_dir=dbt_profiles_dir,
+            )
+            if not dbt_post_result.is_success:
+                logger.warning(
+                    f"Post-load dbt build failed with return code {dbt_post_result.return_code}"
+                )
+                pipeline_metrics["steps_completed"].append("dbt_post_load (with errors)")
+            else:
+                pipeline_metrics["steps_completed"].append("dbt_post_load")
+                logger.info("Reporting models refreshed successfully")
+        except Exception as e:
+            pipeline_metrics["steps_failed"].append("dbt_post_load")
+            logger.warning(f"Post-load dbt build failed (non-critical): {e}")
+
         # 6. Reporting
         try:
             logger.info("Step 6: Generating reports...")
