@@ -41,6 +41,7 @@ OPENROUTER_MODEL=anthropic/claude-sonnet-4-5
 # TUNING_REVIEW_MAX_REJECTS=3
 # TUNING_NO_IMPROVE_ITERS=3
 # TUNING_PLAYER_MIN_HISTORY=10
+# LOG_TARGET=1
 
 # =============================================================================
 # PIPELINE CONFIGURATION (Optional)

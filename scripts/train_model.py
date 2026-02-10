@@ -40,6 +40,15 @@ MAX_DEPTH = 5
 ENABLE_CALIBRATION = True
 CALIBRATION_STRENGTH = 0.8
 FEATURES_TO_SCALE = ['total_points', 'minutes_played', 'ict_index']
+LOG_TARGET = os.getenv("LOG_TARGET", "1").lower() in {"1", "true", "yes"}
+
+
+def _transform_target(y: pd.Series) -> pd.Series:
+    return np.sign(y) * np.log1p(np.abs(y))
+
+
+def _inverse_transform(pred: np.ndarray) -> np.ndarray:
+    return np.sign(pred) * np.expm1(np.abs(pred))
 
 
 def fetch_training_data() -> pd.DataFrame:
@@ -103,7 +112,17 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     df['is_mid'] = (df['position_id'] == 3).astype(int)
     df['is_fwd'] = (df['position_id'] == 4).astype(int)
     
-    # 3. Fill missing values with sensible defaults
+    # 3. Minutes bands (one-hot)
+    if 'minutes_played' in df.columns:
+        df['minutes_band'] = pd.cut(
+            df['minutes_played'],
+            bins=[-1, 30, 60, 1_000_000],
+            labels=['0_30', '31_60', '61_90'],
+        )
+        band_dummies = pd.get_dummies(df['minutes_band'], prefix='minutes_band')
+        df = pd.concat([df, band_dummies], axis=1)
+
+    # 4. Fill missing values with sensible defaults
     numeric_cols = df.select_dtypes(include=[np.number]).columns
     df[numeric_cols] = df[numeric_cols].fillna(0)
     
@@ -320,6 +339,11 @@ def select_features() -> list:
         'is_def',
         'is_mid',
         'is_fwd',
+
+        # Minutes bands
+        'minutes_band_0_30',
+        'minutes_band_31_60',
+        'minutes_band_61_90',
         
     ]
     
@@ -358,18 +382,22 @@ def train_xgboost_model(X: pd.DataFrame, y: pd.Series) -> xgb.XGBRegressor:
     tscv = TimeSeriesSplit(n_splits=5)
     
     logger.info("Running time series cross-validation...")
-    cv_scores = cross_val_score(
-        model, X, y, 
-        cv=tscv, 
-        scoring='neg_mean_absolute_error',
-        n_jobs=-1
-    )
-    
-    logger.info(f"Cross-validation MAE: {-cv_scores.mean():.3f} (+/- {cv_scores.std():.3f})")
+    y_train = _transform_target(y) if LOG_TARGET else y
+    cv_mae_scores = []
+    for train_idx, val_idx in tscv.split(X):
+        model_cv = xgb.XGBRegressor(**model.get_params())
+        model_cv.fit(X.iloc[train_idx], y_train.iloc[train_idx])
+        preds = model_cv.predict(X.iloc[val_idx])
+        if LOG_TARGET:
+            preds = _inverse_transform(preds)
+        cv_mae_scores.append(mean_absolute_error(y.iloc[val_idx], preds))
+    cv_mae = float(np.mean(cv_mae_scores))
+    cv_std = float(np.std(cv_mae_scores))
+    logger.info(f"Cross-validation MAE: {cv_mae:.3f} (+/- {cv_std:.3f})")
     
     # Train final model on all data
     logger.info("Training final model on full dataset...")
-    model.fit(X, y)
+    model.fit(X, y_train)
     
     return model
 
@@ -389,6 +417,8 @@ def evaluate_model(model: xgb.XGBRegressor, X: pd.DataFrame, y: pd.Series):
     
     # Generate predictions
     y_pred = model.predict(X)
+    if LOG_TARGET:
+        y_pred = _inverse_transform(y_pred)
     
     # Calculate metrics
     mae = mean_absolute_error(y, y_pred)
