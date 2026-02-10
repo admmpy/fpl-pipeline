@@ -201,7 +201,8 @@ class TestEnsureZScoreColumns:
     def test_no_stats_computes_from_df(self):
         df = pd.DataFrame({"total_points": [10.0, 20.0]})
         result = ensure_z_score_columns(df, ["total_points"], stats=None)
-        expected = np.array([-1.0, 1.0])
+        # pandas .std() uses ddof=1 (sample std), so std=7.071 for [10, 20]
+        expected = (np.array([10.0, 20.0]) - 15.0) / df["total_points"].std()
         np.testing.assert_array_almost_equal(
             result["total_points_z_score"].to_numpy(), expected
         )
