@@ -22,6 +22,15 @@ SNOWFLAKE_WAREHOUSE=COMPUTE_WH
 SLACK_WEBHOOK_URL=
 
 # =============================================================================
+# OPENROUTER CONFIGURATION
+# =============================================================================
+# API key and base URL for OpenRouter (used by hyperparameter tuning agent)
+# Get your key from: https://openrouter.ai/keys
+OPENROUTER_API_KEY=your-key-here
+OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
+OPENROUTER_MODEL=anthropic/claude-sonnet-4-5
+
+# =============================================================================
 # PIPELINE CONFIGURATION (Optional)
 # =============================================================================
 # These have defaults in code but can be overridden here if needed

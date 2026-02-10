@@ -178,6 +178,9 @@ def run_ml_inference(df: pd.DataFrame, model_path: str = "logs/model.bin") -> Li
             stats=None,
             logger=logger
         )
+        if 'total_points_z_score' not in df.columns:
+            logger.warning("total_points_z_score still missing after ensure_z_score_columns; defaulting to 0")
+            df['total_points_z_score'] = 0.0
         total_points_z = df['total_points_z_score'].fillna(0)
 
         df['expected_points_next_gw'] = (

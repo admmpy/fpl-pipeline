@@ -191,6 +191,7 @@ def fpl_weekly_orchestration(
             raise
 
     # 3. ML Inference
+    predictions = []
     try:
         logger.info("Step 3: Running ML inference...")
         feature_df = fetch_training_data()
@@ -199,57 +200,64 @@ def fpl_weekly_orchestration(
         pipeline_metrics["steps_completed"].append("ml_inference")
         pipeline_metrics["prediction_count"] = len(predictions)
         logger.info(f"ML inference completed: {len(predictions)} predictions")
-        
+
     except Exception as e:
         pipeline_metrics["steps_failed"].append("ml_inference")
         logger.error(f"ML inference failed: {e}")
-        raise
+        logger.warning("Skipping optimization and loading — dashboard will use previous data")
 
-    # 4. Optimization
-    try:
-        logger.info("Step 4: Running squad optimization...")
-        recommended_squad = optimize_squad_task(predictions)
-        pipeline_metrics["steps_completed"].append("optimization")
-        pipeline_metrics["squad_size"] = len(recommended_squad)
-        logger.info(f"Optimization completed: {len(recommended_squad)} players selected")
-        
-    except Exception as e:
-        pipeline_metrics["steps_failed"].append("optimization")
-        logger.error(f"Optimization failed: {e}")
-        raise
+    # 4-6: Only run if predictions were generated
+    load_result = {}
+    recommended_squad = []
+    if predictions:
+        # 4. Optimization
+        try:
+            logger.info("Step 4: Running squad optimization...")
+            recommended_squad = optimize_squad_task(predictions)
+            pipeline_metrics["steps_completed"].append("optimization")
+            pipeline_metrics["squad_size"] = len(recommended_squad)
+            logger.info(f"Optimization completed: {len(recommended_squad)} players selected")
 
-    # 5. Load Recommendations to Snowflake
-    try:
-        logger.info("Step 5: Loading recommendations to Snowflake...")
-        ensure_typed_table_exists("recommended_squad")
-        load_result = load_typed_records_to_snowflake(
-            table_name="recommended_squad",
-            records=recommended_squad
-        )
-        pipeline_metrics["steps_completed"].append("load_recommendations")
-        pipeline_metrics["records_loaded"] = load_result.get("loaded", 0)
-        logger.info(f"Loaded {load_result.get('loaded', 0)} recommendations to Snowflake")
-        
-    except Exception as e:
-        pipeline_metrics["steps_failed"].append("load_recommendations")
-        logger.error(f"Loading recommendations failed: {e}")
-        raise
+        except Exception as e:
+            pipeline_metrics["steps_failed"].append("optimization")
+            logger.error(f"Optimization failed: {e}")
+            raise
 
-    # 6. Reporting
-    try:
-        logger.info("Step 6: Generating reports...")
-        summary = format_squad_summary(recommended_squad)
-        send_slack_notification(summary, webhook_url=slack_webhook_url)
-        pipeline_metrics["steps_completed"].append("reporting")
-        logger.info("Reports generated and sent")
-        
-    except Exception as e:
-        # Reporting failures should not stop the pipeline
-        logger.warning(f"Reporting failed (non-critical): {e}")
-        pipeline_metrics["steps_completed"].append("reporting (with errors)")
-    
+        # 5. Load Recommendations to Snowflake
+        try:
+            logger.info("Step 5: Loading recommendations to Snowflake...")
+            ensure_typed_table_exists("recommended_squad")
+            load_result = load_typed_records_to_snowflake(
+                table_name="recommended_squad",
+                records=recommended_squad
+            )
+            pipeline_metrics["steps_completed"].append("load_recommendations")
+            pipeline_metrics["records_loaded"] = load_result.get("loaded", 0)
+            logger.info(f"Loaded {load_result.get('loaded', 0)} recommendations to Snowflake")
+
+        except Exception as e:
+            pipeline_metrics["steps_failed"].append("load_recommendations")
+            logger.error(f"Loading recommendations failed: {e}")
+            raise
+
+        # 6. Reporting
+        try:
+            logger.info("Step 6: Generating reports...")
+            summary = format_squad_summary(recommended_squad)
+            send_slack_notification(summary, webhook_url=slack_webhook_url)
+            pipeline_metrics["steps_completed"].append("reporting")
+            logger.info("Reports generated and sent")
+
+        except Exception as e:
+            # Reporting failures should not stop the pipeline
+            logger.warning(f"Reporting failed (non-critical): {e}")
+            pipeline_metrics["steps_completed"].append("reporting (with errors)")
+    else:
+        logger.warning("No predictions available — skipping optimization, load, and reporting")
+        pipeline_metrics["steps_completed"].append("skipped_downstream (no predictions)")
+
     logger.info("Weekly orchestration completed successfully!")
-    
+
     return {
         "ingestion_results": ingestion_results,
         "dbt": {
