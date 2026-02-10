@@ -52,7 +52,7 @@ def format_squad_summary(squad_records: List[Dict[str, Any]]) -> str:
         captain_star = " (C)" if player.get('is_captain') else ""
         vice_star = " (VC)" if player.get('is_vice_captain') else ""
         
-        expected_pts = player.get('expected_points_5_gw', 0)
+        expected_pts = player.get('expected_points_next_gw', 0)
         cost = player.get('now_cost', 0)
         
         line = (
