@@ -31,6 +31,18 @@ OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
 OPENROUTER_MODEL=anthropic/claude-sonnet-4-5
 
 # =============================================================================
+# TUNING AGENT CONFIGURATION (Optional)
+# =============================================================================
+# Realism gate thresholds and reviewer tuning
+# TUNING_BIAS_SD_MULT=0.25
+# TUNING_POS_P95_EXCEED_PCT=0.05
+# TUNING_PLAYER_P95_EXCEED_PCT=0.05
+# TUNING_RMSE_WORSE_PCT=0.05
+# TUNING_REVIEW_MAX_REJECTS=3
+# TUNING_NO_IMPROVE_ITERS=3
+# TUNING_PLAYER_MIN_HISTORY=10
+
+# =============================================================================
 # PIPELINE CONFIGURATION (Optional)
 # =============================================================================
 # These have defaults in code but can be overridden here if needed

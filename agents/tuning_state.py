@@ -18,6 +18,7 @@ class TuningState(TypedDict):
     current_params: dict  # Params for the next experiment
     best_params: dict
     best_holdout_mae: float
+    best_holdout_rmse: float
 
     # Control
     iteration: int
@@ -26,6 +27,14 @@ class TuningState(TypedDict):
 
     # LLM context
     analysis: str  # LLM's reasoning about latest results
+
+    # Reviewer context
+    sanity_metrics: dict
+    gates_passed: bool
+    gate_details: dict
+    review_decision: str
+    review_feedback: str
+    reject_count: int
 
 
 # Hyperparameter search space bounds
