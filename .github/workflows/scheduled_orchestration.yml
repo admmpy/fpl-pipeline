@@ -43,6 +43,14 @@ jobs:
         with:
           repository: admmpy/fpl-dbt-sf
           path: dbt_project
+      
+      - name: Log pipeline commit
+        run: |
+          echo "Pipeline repo HEAD:"
+          git rev-parse HEAD
+          git show -s --oneline HEAD
+          echo "Fallback snippet (tasks/ml_tasks.py):"
+          sed -n '150,200p' tasks/ml_tasks.py
 
       - name: Set up Python
         uses: actions/setup-python@v5
