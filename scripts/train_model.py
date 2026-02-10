@@ -40,7 +40,7 @@ MAX_DEPTH = 5
 ENABLE_CALIBRATION = True
 CALIBRATION_STRENGTH = 0.8
 FEATURES_TO_SCALE = ['total_points', 'minutes_played', 'ict_index']
-LOG_TARGET = os.getenv("LOG_TARGET", "").lower() in {"1", "true", "yes"}
+LOG_TARGET = os.getenv("LOG_TARGET", "1").lower() in {"1", "true", "yes"}
 
 
 def _transform_target(y: pd.Series) -> pd.Series:
