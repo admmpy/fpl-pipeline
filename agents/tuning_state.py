@@ -44,8 +44,11 @@ SEARCH_SPACE = {
     "learning_rate": {"min": 0.01, "max": 0.3, "type": "float"},
     "subsample": {"min": 0.5, "max": 1.0, "type": "float"},
     "colsample_bytree": {"min": 0.5, "max": 1.0, "type": "float"},
-    "reg_alpha": {"min": 0.0, "max": 2.0, "type": "float"},
-    "reg_lambda": {"min": 0.1, "max": 5.0, "type": "float"},
+    "reg_alpha": {"min": 0.0, "max": 10.0, "type": "float"},
+    "reg_lambda": {"min": 0.1, "max": 10.0, "type": "float"},
+    "min_child_weight": {"min": 0.1, "max": 10.0, "type": "float"},
+    "gamma": {"min": 0.0, "max": 5.0, "type": "float"},
+    "max_delta_step": {"min": 0.0, "max": 10.0, "type": "float"},
     "shrinkage_alpha": {"min": 0.0, "max": 0.5, "type": "float"},
     "calibration_strength": {"min": 0.0, "max": 1.0, "type": "float"},
 }
@@ -59,6 +62,9 @@ DEFAULT_PARAMS = {
     "colsample_bytree": 0.8,
     "reg_alpha": 0.1,
     "reg_lambda": 1.0,
+    "min_child_weight": 1.0,
+    "gamma": 0.0,
+    "max_delta_step": 0.0,
     "shrinkage_alpha": 0.0,
     "calibration_strength": 0.8,
 }

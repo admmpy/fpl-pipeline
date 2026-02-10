@@ -31,6 +31,17 @@ logger = logging.getLogger(__name__)
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _use_log_target() -> bool:
+    return os.environ.get("TUNING_LOG_TARGET", "1").lower() in {"1", "true", "yes"}
+
+
+def _transform_target(y: pd.Series) -> pd.Series:
+    return np.sign(y) * np.log1p(np.abs(y))
+
+
+def _inverse_transform(pred: np.ndarray) -> np.ndarray:
+    return np.sign(pred) * np.expm1(np.abs(pred))
+
 def _env_float(name: str, default: float) -> float:
     val = os.environ.get(name)
     if val is None or val == "":
@@ -283,17 +294,27 @@ def train_evaluate(state: TuningState) -> dict:
         eval_metric="mae",
     )
 
+    use_log_target = _use_log_target()
+    y_train_trans = _transform_target(y_train) if use_log_target else y_train
     tscv = TimeSeriesSplit(n_splits=5)
-    cv_scores = cross_val_score(
-        model, X_train, y_train, cv=tscv, scoring="neg_mean_absolute_error", n_jobs=-1
-    )
-    cv_mae = float(-cv_scores.mean())
-    logger.info(f"CV MAE: {cv_mae:.4f} (+/- {cv_scores.std():.4f})")
+    cv_scores = []
+    for train_idx, val_idx in tscv.split(X_train):
+        model_cv = xgb.XGBRegressor(**model.get_params())
+        model_cv.fit(X_train.iloc[train_idx], y_train_trans.iloc[train_idx])
+        preds = model_cv.predict(X_train.iloc[val_idx])
+        if use_log_target:
+            preds = _inverse_transform(preds)
+        cv_scores.append(mean_absolute_error(y_train.iloc[val_idx], preds))
+    cv_mae = float(np.mean(cv_scores))
+    cv_std = float(np.std(cv_scores))
+    logger.info(f"CV MAE: {cv_mae:.4f} (+/- {cv_std:.4f})")
 
-    model.fit(X_train, y_train)
+    model.fit(X_train, y_train_trans)
 
     league_mean = float(y_train.mean())
     holdout_pred = model.predict(X_holdout)
+    if use_log_target:
+        holdout_pred = _inverse_transform(holdout_pred)
     holdout_pred = train_model.apply_shrinkage(holdout_pred, league_mean, shrinkage_alpha)
 
     if calibration_strength > 0:
@@ -387,8 +408,9 @@ def propose_params(state: TuningState) -> dict:
             f"n_est={p['n_estimators']} depth={p['max_depth']} "
             f"lr={p['learning_rate']} sub={p['subsample']} "
             f"col={p['colsample_bytree']} alpha={p['reg_alpha']} "
-            f"lambda={p['reg_lambda']} shrink={p['shrinkage_alpha']} "
-            f"calib={p['calibration_strength']}"
+            f"lambda={p['reg_lambda']} min_child={p['min_child_weight']} "
+            f"gamma={p['gamma']} delta={p['max_delta_step']} "
+            f"shrink={p['shrinkage_alpha']} calib={p['calibration_strength']}"
         )
     history_text = "\n".join(history_lines)
 
@@ -424,7 +446,7 @@ Respond with:
 - A brief analysis paragraph (2-4 sentences).
 - Then a JSON block with the exact next parameters to try.
 
-IMPORTANT: Return ALL 9 parameters in the JSON. Use this exact format:
+IMPORTANT: Return ALL 12 parameters in the JSON. Use this exact format:
 ```json
 {{
   \"n_estimators\": <int>,
@@ -434,6 +456,9 @@ IMPORTANT: Return ALL 9 parameters in the JSON. Use this exact format:
   \"colsample_bytree\": <float>,
   \"reg_alpha\": <float>,
   \"reg_lambda\": <float>,
+  \"min_child_weight\": <float>,
+  \"gamma\": <float>,
+  \"max_delta_step\": <float>,
   \"shrinkage_alpha\": <float>,
   \"calibration_strength\": <float>
 }}
