@@ -22,6 +22,7 @@ Optional gate controls (see `ENV_EXAMPLE.txt` for defaults):
 - `TUNING_REVIEW_MAX_REJECTS`
 - `TUNING_NO_IMPROVE_ITERS`
 - `TUNING_PLAYER_MIN_HISTORY`
+- `TUNING_LOG_TARGET` (default: on; signed log transform for targets)
 
 ## Fast Run (Quick Validation)
 Use a short run with stricter gates:
@@ -36,3 +37,6 @@ python scripts/run_tuning_dual.py --max-iterations 3
 ## Notes
 - `scripts/run_once.py` is separate. When you use it, run with `RUN_ONCE_FAST=1` to avoid long full runs.
 - The dual-agent workflow only updates best params when gates pass.
+- Targets use a signed log transform by default (`LOG_TARGET=1` for training; `TUNING_LOG_TARGET=1` for tuning).
+- Minutes-band features are included: `minutes_band_0_30`, `minutes_band_31_60`, `minutes_band_61_90`.
+- Tuning search space now includes `min_child_weight`, `gamma`, and `max_delta_step`.
