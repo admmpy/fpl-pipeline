@@ -23,6 +23,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--run-id", default=f"autonomous_{uuid.uuid4().hex[:12]}")
     parser.add_argument("--rules-path", default="config/domain_rules.yaml")
     parser.add_argument("--snapshot-path", default=None)
+    parser.add_argument("--local-snapshot-path", default=None)
+    parser.add_argument("--data-source", choices=["local", "snowflake"], default=None)
+    parser.add_argument(
+        "--data-policy",
+        choices=["LOCAL_ONLY", "LOCAL_THEN_SNOWFLAKE"],
+        default=None,
+    )
     parser.add_argument("--force-drift", action="store_true")
     parser.add_argument("--force-no-drift", action="store_true")
     parser.add_argument("--optuna-trials", type=int, default=None)
@@ -43,8 +50,14 @@ def main() -> int:
         "force_drift": bool(args.force_drift),
         "force_no_drift": bool(args.force_no_drift),
     }
-    if args.snapshot_path:
-        snapshot_meta["snapshot_path"] = args.snapshot_path
+    resolved_local_snapshot = args.local_snapshot_path or args.snapshot_path
+    if resolved_local_snapshot:
+        snapshot_meta["local_snapshot_path"] = resolved_local_snapshot
+        snapshot_meta["snapshot_path"] = resolved_local_snapshot
+    if args.data_source:
+        snapshot_meta["data_source"] = args.data_source
+    if args.data_policy:
+        snapshot_meta["data_policy"] = args.data_policy
     if args.optuna_trials:
         snapshot_meta["optuna_trials"] = args.optuna_trials
 

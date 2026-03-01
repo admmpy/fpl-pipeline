@@ -32,3 +32,9 @@ Thumbs.db
 
 # DBT and ML
 logs/
+
+# Local training snapshots
+data/**
+!data/.gitkeep
+!data/training/
+!data/training/.gitkeep

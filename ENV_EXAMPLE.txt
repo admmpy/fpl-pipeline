@@ -56,3 +56,24 @@ OPENROUTER_MODEL=anthropic/claude-sonnet-4-5
 
 # Delay between retries (seconds)
 # RETRY_DELAY=5
+
+# =============================================================================
+# LOCAL-FIRST TRAINING SNAPSHOT CONFIGURATION (Optional)
+# =============================================================================
+# Source selection for training/autonomous loaders: local or snowflake
+# TRAINING_DATA_SOURCE=local
+
+# Local snapshot policy:
+#   LOCAL_ONLY: fail fast if local snapshot is unavailable/invalid
+#   LOCAL_THEN_SNOWFLAKE: fallback to Snowflake for resilience
+# TRAINING_DATA_POLICY=LOCAL_ONLY
+
+# Local snapshot directory and optional explicit file override
+# LOCAL_DATA_DIR=pipeline/data/training
+# LOCAL_TRAINING_DATA_PATH=pipeline/data/training/latest.parquet
+
+# Maximum age before snapshot is considered stale
+# SNAPSHOT_MAX_AGE_DAYS=8
+
+# Number of versioned snapshots retained by refresh script
+# LOCAL_SNAPSHOT_RETENTION_COUNT=12

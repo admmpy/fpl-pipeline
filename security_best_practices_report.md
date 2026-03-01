@@ -1,5 +1,38 @@
 # Security Best Practices Report
 
+## Review
+Date: 2026-03-01
+Branch: `feat/local-first-snapshot-v2`
+Scope: local-first snapshot system (`utils/local_data.py`, `scripts/refresh_local_training_snapshot.py`, loader integrations in training/tasks/autonomous)
+
+### Severity-Ranked Findings
+
+#### Critical
+- No critical security findings identified in this review scope.
+
+#### High
+- No high-severity security findings identified in this review scope.
+
+#### Medium
+1. **SBP-005: Local refresh lock can be held indefinitely if process dies before cleanup**
+- Location: `scripts/refresh_local_training_snapshot.py:73`
+- Risk: A stale `.refresh.lock` can block future refresh runs until manual operator intervention.
+- Decision: Deferred (non-critical; fail-safe behaviour preserves pointer integrity).
+- Recommended follow-up: Add stale lock age/owner validation and optional `--force-unlock` workflow.
+
+#### Low
+1. **SBP-006: Source table is user-configurable, but constrained by identifier regex only**
+- Location: `utils/local_data.py:583`
+- Risk: Misconfiguration could still point at an unintended internal table.
+- Decision: Deferred.
+- Recommended follow-up: Add explicit allowlist for approved source tables in production-like environments.
+
+### Overall Gate Decision
+- Security gate: **PASS**
+- No critical security fixes required.
+
+---
+
 Date: 2026-03-01
 Branch: `feat/autonomous-optimiser-phase1`
 Scope: autonomous optimisation loop additions (`agents/autonomous_*`, `utils/model_registry.py`, `scripts/run_autonomous_loop.py`, related tests)

@@ -9,6 +9,12 @@ import pickle
 from prefect import task, get_run_logger
 from prefect.exceptions import MissingContextError
 from utils.snowflake_client import get_snowflake_connection
+from utils.local_data import (
+    build_training_query,
+    emit_selection_log,
+    load_training_dataframe,
+)
+from config import get_snowflake_config
 import os
 
 DEFAULT_SHRINKAGE_ALPHA = 0.0
@@ -98,28 +104,37 @@ def ensure_z_score_columns(
     return df
 
 @task
-def fetch_training_data(table_name: str = "fct_ml_player_features") -> pd.DataFrame:
+def fetch_training_data(
+    table_name: str = "fct_ml_player_features",
+    source: Optional[str] = None,
+    local_path: Optional[str] = None,
+    policy: Optional[str] = None,
+) -> pd.DataFrame:
     """
-    Fetch the denormalized feature table from Snowflake for training/inference.
+    Fetch the denormalized feature table using local-first policy controls.
     """
     logger = get_logger()
     logger.info(f"Fetching features from {table_name}...")
-    
-    query = f"""
-    SELECT 
-        f.* EXCLUDE (now_cost),
-        COALESCE(f.now_cost, p.current_value) AS now_cost,
-        p.position_id
-    FROM {table_name} f
-    LEFT JOIN dim_players p ON f.player_id = p.player_id
-    """
-    
-    with get_snowflake_connection() as conn:
-        df = pd.read_sql(query, conn)
-    
-    # Standardize column names to lowercase (Snowflake returns UPPERCASE by default)
-    df.columns = [c.lower() for c in df.columns]
-        
+
+    def _snowflake_loader(source_table: str) -> pd.DataFrame:
+        if get_snowflake_config() is None:
+            raise ValueError("Snowflake configuration not found. Cannot fetch training data.")
+        query = build_training_query(source_table, apply_training_filters=False)
+        with get_snowflake_connection() as conn:
+            frame = pd.read_sql(query, conn)
+        frame.columns = [str(column).lower() for column in frame.columns]
+        return frame
+
+    df, metadata = load_training_dataframe(
+        table_name=table_name,
+        source=source,
+        local_path=local_path,
+        policy=policy,
+        snowflake_loader=_snowflake_loader,
+        logger=logger,
+    )
+    emit_selection_log(logger, context="tasks.ml_tasks.fetch_training_data", metadata=metadata)
+
     logger.info(f"Fetched {len(df)} rows.")
     return df
 
