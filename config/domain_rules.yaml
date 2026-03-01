@@ -1,0 +1,52 @@
+version: "1.0.0"
+schema:
+  required_columns:
+    - player_id
+    - gameweek_id
+    - target_gameweek_id
+    - target_next_gw_points
+    - position_id
+    - total_points
+    - minutes_played
+    - ict_index
+  dtypes:
+    player_id: integer
+    gameweek_id: integer
+    target_gameweek_id: integer
+    target_next_gw_points: number
+    position_id: integer
+    total_points: number
+    minutes_played: number
+    ict_index: number
+  null_limits:
+    target_next_gw_points: 0.0
+    player_id: 0.0
+    gameweek_id: 0.0
+  duplicate_key_limits:
+    keys:
+      - player_id
+      - gameweek_id
+    max_ratio: 0.0
+split:
+  holdout_gameweeks: 5
+  temporal_leakage:
+    source_column: gameweek_id
+    target_column: target_gameweek_id
+    allow_equal: false
+drift:
+  columns:
+    - total_points
+    - minutes_played
+    - ict_index
+  ks_threshold: 0.2
+  breach_ratio: 0.34
+optimisation:
+  optuna_trials: 8
+  random_seed: 42
+model:
+  max_mae: 6.0
+  max_rmse: 8.0
+  max_abs_bias: 1.0
+  max_position_exceed_rate: 0.1
+  max_player_exceed_rate: 0.1
+  rmse_deterioration_pct: 0.03
