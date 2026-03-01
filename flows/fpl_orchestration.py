@@ -167,7 +167,9 @@ def fpl_weekly_orchestration(
 
         if not dbt_result.is_success:
             error_msg = f"dbt build failed with return code {dbt_result.return_code}"
-            
+            logger.error(f"dbt stderr: {dbt_result.stderr}")
+            logger.error(f"dbt stdout: {dbt_result.stdout}")
+
             if not allow_stale_data:
                 notify_pipeline_failure.fn(
                     flow_name="FPL Orchestration - dbt",
@@ -264,6 +266,8 @@ def fpl_weekly_orchestration(
                     logger.warning(
                         f"Post-load dbt build failed with return code {dbt_post_result.return_code}"
                     )
+                    logger.error(f"dbt stderr: {dbt_post_result.stderr}")
+                    logger.error(f"dbt stdout: {dbt_post_result.stdout}")
                     pipeline_metrics["steps_completed"].append("dbt_post_load (with errors)")
                 else:
                     pipeline_metrics["steps_completed"].append("dbt_post_load")
