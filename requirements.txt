@@ -64,6 +64,7 @@ opentelemetry-exporter-prometheus==0.60b1
 opentelemetry-instrumentation==0.60b1
 opentelemetry-sdk==1.39.1
 opentelemetry-semantic-conventions==0.60b1
+optuna==4.5.0
 orjson==3.11.5
 packaging==25.0
 pandas==2.3.3
