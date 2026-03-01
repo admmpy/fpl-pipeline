@@ -23,6 +23,7 @@ FPL API
 **VARIANT Tables (INSERT):** raw_element_summary
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed data flow diagrams.
+See [docs/AUTONOMOUS_OPTIMISATION.md](docs/AUTONOMOUS_OPTIMISATION.md) for the autonomous optimisation loop design and runtime contract.
 
 ## Project Structure
 

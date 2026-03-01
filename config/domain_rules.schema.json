@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Autonomous Domain Rules",
+  "type": "object",
+  "required": ["version", "schema", "split", "drift", "optimisation", "model"],
+  "additionalProperties": false,
+  "properties": {
+    "version": {"type": "string", "minLength": 1},
+    "schema": {
+      "type": "object",
+      "required": ["required_columns", "dtypes", "null_limits", "duplicate_key_limits"],
+      "additionalProperties": false,
+      "properties": {
+        "required_columns": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+        "dtypes": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {
+            "type": "string",
+            "enum": ["integer", "number", "string", "boolean"]
+          }
+        },
+        "null_limits": {
+          "type": "object",
+          "additionalProperties": {"type": "number", "minimum": 0.0, "maximum": 1.0}
+        },
+        "duplicate_key_limits": {
+          "type": "object",
+          "required": ["keys", "max_ratio"],
+          "additionalProperties": false,
+          "properties": {
+            "keys": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+            "max_ratio": {"type": "number", "minimum": 0.0, "maximum": 1.0}
+          }
+        }
+      }
+    },
+    "split": {
+      "type": "object",
+      "required": ["holdout_gameweeks", "temporal_leakage"],
+      "additionalProperties": false,
+      "properties": {
+        "holdout_gameweeks": {"type": "integer", "minimum": 1},
+        "temporal_leakage": {
+          "type": "object",
+          "required": ["source_column", "target_column", "allow_equal"],
+          "additionalProperties": false,
+          "properties": {
+            "source_column": {"type": "string"},
+            "target_column": {"type": "string"},
+            "allow_equal": {"type": "boolean"}
+          }
+        }
+      }
+    },
+    "drift": {
+      "type": "object",
+      "required": ["columns", "ks_threshold", "breach_ratio"],
+      "additionalProperties": false,
+      "properties": {
+        "columns": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+        "ks_threshold": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+        "breach_ratio": {"type": "number", "minimum": 0.0, "maximum": 1.0}
+      }
+    },
+    "optimisation": {
+      "type": "object",
+      "required": ["optuna_trials", "random_seed"],
+      "additionalProperties": false,
+      "properties": {
+        "optuna_trials": {"type": "integer", "minimum": 1},
+        "random_seed": {"type": "integer"}
+      }
+    },
+    "model": {
+      "type": "object",
+      "required": [
+        "max_mae",
+        "max_rmse",
+        "max_abs_bias",
+        "max_position_exceed_rate",
+        "max_player_exceed_rate",
+        "rmse_deterioration_pct"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "max_mae": {"type": "number", "minimum": 0.0},
+        "max_rmse": {"type": "number", "minimum": 0.0},
+        "max_abs_bias": {"type": "number", "minimum": 0.0},
+        "max_position_exceed_rate": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+        "max_player_exceed_rate": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+        "rmse_deterioration_pct": {"type": "number", "minimum": 0.0, "maximum": 1.0}
+      }
+    }
+  }
+}
