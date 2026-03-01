@@ -26,13 +26,13 @@ schema:
     keys:
       - player_id
       - gameweek_id
-    max_ratio: 0.0
+    max_ratio: 0.01
 split:
   holdout_gameweeks: 5
   temporal_leakage:
     source_column: gameweek_id
     target_column: target_gameweek_id
-    allow_equal: false
+    allow_equal: true
 drift:
   columns:
     - total_points

@@ -127,6 +127,29 @@ def test_no_drift_path_exits_without_retrain(tmp_path, monkeypatch):
     assert final_state.get("optuna_result", {}) == {}
 
 
+def test_validation_failure_routes_to_record_evidence_without_drift_node_error(tmp_path, monkeypatch):
+    _patch_runtime_dirs(monkeypatch, tmp_path)
+    rules_path = _rules_file(tmp_path)
+
+    broken_df = _dataset().drop(columns=["target_next_gw_points"])
+
+    graph = build_autonomous_graph()
+    state = create_initial_state(
+        "run-validation-fail",
+        snapshot_meta={
+            "dataframe": broken_df,
+            "rules_path": str(rules_path),
+        },
+    )
+
+    final_state = graph.invoke(state)
+
+    assert final_state["state"] == "FAILED"
+    assert final_state["error"]["type"] in {"ValidationError", "ValueError"}
+    assert final_state["error"]["node"] != "detect_drift"
+    assert Path(final_state["evidence_path"]).exists()
+
+
 def test_drift_path_can_promote_deterministically(tmp_path, monkeypatch):
     logs_dir = _patch_runtime_dirs(monkeypatch, tmp_path)
     rules_path = _rules_file(tmp_path, mutate={"optimisation.optuna_trials": 2})

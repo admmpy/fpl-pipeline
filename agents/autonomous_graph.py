@@ -28,6 +28,20 @@ def _route_after_drift(state: AutonomousState) -> str:
     return "record_evidence"
 
 
+def _route_after_ingest(state: AutonomousState) -> str:
+    current = state.get("state")
+    if current == "INGESTED":
+        return "validate_snapshot"
+    return "record_evidence"
+
+
+def _route_after_validate(state: AutonomousState) -> str:
+    current = state.get("state")
+    if current == "VALIDATED":
+        return "detect_drift"
+    return "record_evidence"
+
+
 def _route_after_rules(state: AutonomousState) -> str:
     current = state.get("state")
     if current == "RULES_PASSED":
@@ -61,8 +75,22 @@ def build_autonomous_graph():
     graph.add_node("record_evidence", record_evidence)
 
     graph.set_entry_point("ingest_snapshot")
-    graph.add_edge("ingest_snapshot", "validate_snapshot")
-    graph.add_edge("validate_snapshot", "detect_drift")
+    graph.add_conditional_edges(
+        "ingest_snapshot",
+        _route_after_ingest,
+        {
+            "validate_snapshot": "validate_snapshot",
+            "record_evidence": "record_evidence",
+        },
+    )
+    graph.add_conditional_edges(
+        "validate_snapshot",
+        _route_after_validate,
+        {
+            "detect_drift": "detect_drift",
+            "record_evidence": "record_evidence",
+        },
+    )
 
     graph.add_conditional_edges(
         "detect_drift",

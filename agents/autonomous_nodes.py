@@ -224,7 +224,14 @@ def _load_snapshot_dataframe(state: AutonomousState) -> pd.DataFrame:
 
 def _dtype_matches(series: pd.Series, expected: str) -> bool:
     if expected == "integer":
-        return pd.api.types.is_integer_dtype(series)
+        if pd.api.types.is_integer_dtype(series):
+            return True
+        if pd.api.types.is_numeric_dtype(series):
+            non_null = series.dropna()
+            if non_null.empty:
+                return True
+            return bool(((non_null % 1) == 0).all())
+        return False
     if expected == "number":
         return pd.api.types.is_numeric_dtype(series)
     if expected == "string":
@@ -235,12 +242,16 @@ def _dtype_matches(series: pd.Series, expected: str) -> bool:
 
 
 def _ensure_targets(df: pd.DataFrame) -> pd.DataFrame:
-    if "target_next_gw_points" in df.columns and "target_gameweek_id" in df.columns:
-        return df
-    engineered = train_model.engineer_features(df)
-    if "target_next_gw_points" not in engineered.columns or "target_gameweek_id" not in engineered.columns:
+    prepared = df.copy()
+    if "target_next_gw_points" not in prepared.columns or "target_gameweek_id" not in prepared.columns:
+        prepared = train_model.engineer_features(prepared)
+    if "target_next_gw_points" not in prepared.columns or "target_gameweek_id" not in prepared.columns:
         raise ValueError("Snapshot is missing target columns and could not be engineered")
-    return engineered
+    prepared = prepared.dropna(subset=["target_next_gw_points", "target_gameweek_id"])
+    prepared = prepared[prepared["target_gameweek_id"] > prepared["gameweek_id"]].copy()
+    if prepared.empty:
+        raise ValueError("No rows remain after filtering non-future target rows")
+    return prepared
 
 
 def _prepare_train_holdout(df: pd.DataFrame, holdout_gameweeks: int) -> tuple[pd.DataFrame, pd.DataFrame, list[str], dict[str, Any]]:
