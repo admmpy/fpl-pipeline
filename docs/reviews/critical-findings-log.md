@@ -23,3 +23,15 @@
 - tradeoff: `Automation may now fail faster; callers depending on previous behaviour must handle non-zero status.`
 - verification: `pytest -q tests/test_run_autonomous_loop.py` -> `2 passed`
 - commit: `f857d5e`
+
+## Entry
+- id: `AR-006`
+- date: `2026-03-01`
+- severity: `Critical`
+- area: `architecture`
+- location: `scripts/refresh_local_training_snapshot.py:112`
+- issue: `Parquet snapshot refresh depended on optional engines not pinned in repository requirements, causing refresh failure in clean environments.`
+- fix: `Added pyarrow as a pinned runtime dependency in requirements.txt.`
+- tradeoff: `Increases environment size and install time, but guarantees deterministic Parquet support for snapshot write/read operations.`
+- verification: `venv/bin/python scripts/refresh_local_training_snapshot.py --output-dir pipeline/data/training --force` -> `status=refreshed`; `venv/bin/pytest -q tests/test_run_autonomous_loop.py tests/test_local_data.py tests/test_refresh_local_training_snapshot.py tests/test_autonomous_loop.py` -> `15 passed`
+- commit: `2b5958c`
