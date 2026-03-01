@@ -34,6 +34,7 @@ from agents.autonomous_state import (
 )
 from agents.tuning_nodes_review import _compute_sanity_metrics
 import train_model
+from utils.local_data import ensure_allowed_path, hash_payload
 from utils.model_registry import (
     DEFAULT_LOGS_DIR,
     get_active_model,
@@ -207,19 +208,50 @@ def _rules_from_state(state: AutonomousState) -> dict[str, Any]:
     return load_domain_rules(rules_path)
 
 
-def _load_snapshot_dataframe(state: AutonomousState) -> pd.DataFrame:
+def _load_snapshot_dataframe(state: AutonomousState) -> tuple[pd.DataFrame, dict[str, Any]]:
     snapshot_meta = state.get("snapshot_meta") or {}
 
     explicit_df = snapshot_meta.get("dataframe")
     if isinstance(explicit_df, pd.DataFrame):
-        return explicit_df.copy()
+        metadata = {
+            "data_source_selected": "in_memory",
+            "data_policy": snapshot_meta.get("data_policy"),
+            "snapshot_path": snapshot_meta.get("snapshot_path"),
+            "snapshot_age_days": None,
+            "schema_version": None,
+            "fallback_taken": False,
+            "fallback_reason": None,
+            "manifest_hash": None,
+            "snapshot_manifest": None,
+            "fallback_event": None,
+        }
+        return explicit_df.copy(), metadata
 
-    snapshot_path = snapshot_meta.get("snapshot_path")
-    if snapshot_path:
-        return pd.read_csv(snapshot_path)
+    local_snapshot_path = snapshot_meta.get("local_snapshot_path") or snapshot_meta.get("snapshot_path")
+    if local_snapshot_path and str(local_snapshot_path).lower().endswith(".csv"):
+        checked_path = ensure_allowed_path(Path(local_snapshot_path), reason="read explicit csv snapshot")
+        df = pd.read_csv(checked_path)
+        metadata = {
+            "data_source_selected": "local",
+            "data_policy": snapshot_meta.get("data_policy"),
+            "snapshot_path": str(checked_path),
+            "snapshot_age_days": None,
+            "schema_version": None,
+            "fallback_taken": False,
+            "fallback_reason": None,
+            "manifest_hash": hash_payload({"snapshot_path": str(checked_path)}),
+            "snapshot_manifest": None,
+            "fallback_event": None,
+        }
+        return df, metadata
 
-    df = train_model.fetch_training_data()
-    return train_model.engineer_features(df)
+    df, metadata = train_model.fetch_training_data(
+        source=snapshot_meta.get("data_source"),
+        local_path=local_snapshot_path,
+        policy=snapshot_meta.get("data_policy"),
+        return_metadata=True,
+    )
+    return df, metadata
 
 
 def _dtype_matches(series: pd.Series, expected: str) -> bool:
@@ -389,6 +421,9 @@ def _evidence_payload(state: AutonomousState) -> dict[str, Any]:
             },
             "code_version": _git_commit(),
             "input_snapshot_hash": snapshot_meta.get("snapshot_hash"),
+            "data_source": snapshot_meta.get("data_source_selected"),
+            "snapshot_manifest": _safe_for_json(snapshot_meta.get("snapshot_manifest")),
+            "fallback_event": _safe_for_json(snapshot_meta.get("fallback_event")),
             "rules_version": rules_version,
             "active_model": {
                 "pre": state.get("previous_model_version"),
@@ -421,7 +456,7 @@ def ingest_snapshot(state: AutonomousState) -> dict[str, Any]:
     run_id = _state_run_id(state)
     try:
         rules = _rules_from_state(state)
-        df = _load_snapshot_dataframe(state)
+        df, source_meta = _load_snapshot_dataframe(state)
         df = _ensure_targets(df)
 
         snapshot_meta = dict(state.get("snapshot_meta") or {})
@@ -433,6 +468,16 @@ def ingest_snapshot(state: AutonomousState) -> dict[str, Any]:
                 "snapshot_hash": _hash_dataframe(df),
                 "rules_path": snapshot_meta.get("rules_path") or str(DEFAULT_RULES_PATH),
                 "rules_version": rules.get("version"),
+                "data_source_selected": source_meta.get("data_source_selected"),
+                "data_policy": source_meta.get("data_policy"),
+                "snapshot_path": source_meta.get("snapshot_path") or snapshot_meta.get("snapshot_path"),
+                "snapshot_age_days": source_meta.get("snapshot_age_days"),
+                "schema_version": source_meta.get("schema_version"),
+                "fallback_taken": bool(source_meta.get("fallback_taken")),
+                "fallback_reason": source_meta.get("fallback_reason"),
+                "manifest_hash": source_meta.get("manifest_hash"),
+                "snapshot_manifest": source_meta.get("snapshot_manifest"),
+                "fallback_event": source_meta.get("fallback_event"),
                 "dataframe": df,
             }
         )
@@ -449,7 +494,17 @@ def ingest_snapshot(state: AutonomousState) -> dict[str, Any]:
             state="INGESTED",
             duration_ms=int((time.perf_counter() - start) * 1000),
             status="ok",
-            detail={"rows": len(df)},
+            detail={
+                "rows": len(df),
+                "data_source_selected": source_meta.get("data_source_selected"),
+                "data_policy": source_meta.get("data_policy"),
+                "snapshot_path": source_meta.get("snapshot_path"),
+                "snapshot_age_days": source_meta.get("snapshot_age_days"),
+                "schema_version": source_meta.get("schema_version"),
+                "fallback_taken": bool(source_meta.get("fallback_taken")),
+                "fallback_reason": source_meta.get("fallback_reason"),
+                "manifest_hash": source_meta.get("manifest_hash"),
+            },
         )
         return update
     except Exception as exc:

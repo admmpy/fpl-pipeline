@@ -24,6 +24,7 @@ FPL API
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed data flow diagrams.
 See [docs/AUTONOMOUS_OPTIMISATION.md](docs/AUTONOMOUS_OPTIMISATION.md) for the autonomous optimisation loop design and runtime contract.
+See [docs/LOCAL_DATA_WORKFLOW.md](docs/LOCAL_DATA_WORKFLOW.md) for local-first training snapshot operations.
 
 ## Project Structure
 
@@ -72,6 +73,14 @@ SNOWFLAKE_SCHEMA=your_schema
 # Run the typed pipeline
 python flows/fpl_ingestion.py
 ```
+
+### 4. Refresh Local Training Snapshot (Weekly)
+
+```bash
+python scripts/refresh_local_training_snapshot.py
+```
+
+Train and autonomous scripts default to local-first snapshot loading. Use `TRAINING_DATA_SOURCE=snowflake` for explicit Snowflake override.
 
 Or import and run:
 

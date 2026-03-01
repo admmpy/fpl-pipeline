@@ -16,7 +16,7 @@ The ML pipeline:
 ### Prerequisites
 
 1. **Data Requirements:**
-   - Snowflake connection configured in `.env`
+   - Local snapshot refreshed weekly (`python scripts/refresh_local_training_snapshot.py`) or Snowflake connection configured for direct mode
    - At least 10+ gameweeks of historical data in `fct_ml_player_features`
    - dbt models built: `dbt build` in `fpl_development/`
 
@@ -31,6 +31,19 @@ The ML pipeline:
 cd /Users/am/Sync/fpl-workspace/pipeline
 source venv/bin/activate  # or activate your environment
 python scripts/train_model.py
+```
+
+### Explicit Source Modes
+
+```bash
+# Local snapshot only (default policy for development)
+TRAINING_DATA_SOURCE=local TRAINING_DATA_POLICY=LOCAL_ONLY python scripts/train_model.py
+
+# Local-first with Snowflake fallback (rollout resilience mode)
+TRAINING_DATA_SOURCE=local TRAINING_DATA_POLICY=LOCAL_THEN_SNOWFLAKE python scripts/train_model.py
+
+# Direct Snowflake mode
+TRAINING_DATA_SOURCE=snowflake python scripts/train_model.py
 ```
 
 ### Expected Output

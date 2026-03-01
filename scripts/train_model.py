@@ -16,7 +16,7 @@ from sklearn.model_selection import TimeSeriesSplit, cross_val_score
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 import pickle
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 import sys
 import os
 
@@ -31,6 +31,11 @@ logger = logging.getLogger(__name__)
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils.snowflake_client import get_snowflake_connection
 from config import get_snowflake_config
+from utils.local_data import (
+    build_training_query,
+    emit_selection_log,
+    load_training_dataframe,
+)
 
 HOLDOUT_GAMEWEEKS = 5
 SHRINKAGE_ALPHA = 0.0
@@ -51,38 +56,70 @@ def _inverse_transform(pred: np.ndarray) -> np.ndarray:
     return np.sign(pred) * np.expm1(np.abs(pred))
 
 
-def fetch_training_data() -> pd.DataFrame:
+def _fetch_training_data_from_snowflake(table_name: str) -> pd.DataFrame:
+    if get_snowflake_config() is None:
+        raise ValueError("Snowflake configuration not found. Cannot fetch training data.")
+
+    query = build_training_query(table_name, apply_training_filters=False)
+    with get_snowflake_connection() as conn:
+        df = pd.read_sql(query, conn)
+
+    df.columns = [str(column).lower() for column in df.columns]
+    return df
+
+
+def _apply_training_filters(df: pd.DataFrame) -> pd.DataFrame:
+    filtered = df.copy()
+    if "gameweek_id" in filtered.columns:
+        filtered = filtered[filtered["gameweek_id"] > 3].copy()
+    if "minutes_played" in filtered.columns:
+        filtered = filtered[filtered["minutes_played"] > 0].copy()
+    return filtered
+
+
+def fetch_training_data(
+    table_name: str = "fct_ml_player_features",
+    source: Optional[str] = None,
+    local_path: Optional[str] = None,
+    policy: Optional[str] = None,
+    max_age_days: Optional[int] = None,
+    return_metadata: bool = False,
+) -> pd.DataFrame | tuple[pd.DataFrame, dict[str, Any]]:
     """
-    Fetch historical player features from Snowflake.
+    Fetch historical player features using local-first policy controls.
     
     Returns:
         DataFrame with player features and target variable (total_points)
     """
-    logger.info("Fetching training data from Snowflake...")
-    
-    if get_snowflake_config() is None:
-        raise ValueError("Snowflake configuration not found. Cannot fetch training data.")
-    
-    query = """
-    SELECT 
-        f.* EXCLUDE (now_cost),
-        COALESCE(f.now_cost, p.current_value) AS now_cost,
-        p.position_id
-    FROM fct_ml_player_features f
-    LEFT JOIN dim_players p ON f.player_id = p.player_id
-    WHERE f.gameweek_id > 3  -- Skip first 3 GWs for rolling stat stability
-        AND f.minutes_played > 0  -- Only players who actually played
-    """
-    
-    with get_snowflake_connection() as conn:
-        df = pd.read_sql(query, conn)
-    
-    # Standardise column names to lowercase
-    df.columns = [c.lower() for c in df.columns]
-    
-    logger.info(f"Fetched {len(df)} training samples across {df['gameweek_id'].nunique()} gameweeks")
-    logger.info(f"Players: {df['player_id'].nunique()}, Date range: GW{df['gameweek_id'].min()}-{df['gameweek_id'].max()}")
-    
+    df, metadata = load_training_dataframe(
+        table_name=table_name,
+        source=source,
+        local_path=local_path,
+        policy=policy,
+        max_age_days=max_age_days,
+        snowflake_loader=_fetch_training_data_from_snowflake,
+        logger=logger,
+    )
+    df = _apply_training_filters(df)
+
+    emit_selection_log(logger, context="scripts.train_model.fetch_training_data", metadata=metadata)
+    if "gameweek_id" in df.columns and "player_id" in df.columns:
+        logger.info(
+            "Fetched %s training samples across %s gameweeks",
+            len(df),
+            df["gameweek_id"].nunique(),
+        )
+        logger.info(
+            "Players: %s, Date range: GW%s-GW%s",
+            df["player_id"].nunique(),
+            df["gameweek_id"].min(),
+            df["gameweek_id"].max(),
+        )
+    else:
+        logger.info("Fetched %s training samples", len(df))
+
+    if return_metadata:
+        return df, metadata
     return df
 
 
