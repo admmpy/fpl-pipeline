@@ -31,7 +31,7 @@ jobs:
       SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
       SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
       DBT_PROFILES_YML: ${{ secrets.DBT_PROFILES_YML }}
-      DBT_PROJECT_DIR: dbt_project
+      DBT_PROJECT_DIR: ${{ github.workspace }}/dbt_project
       DBT_PROFILES_DIR: /home/runner/.dbt
 
     steps:
