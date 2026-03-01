@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import List, Optional
 import subprocess
 import shutil
+from pathlib import Path
 
 from prefect import task, get_run_logger
 
@@ -51,16 +52,47 @@ def run_dbt_command(
             stderr="dbt not found on PATH",
         )
 
-    full_command = command.copy()
+    raw_project_dir = project_dir
+    resolved_project_dir = str(Path(project_dir).expanduser().resolve())
+    if not Path(resolved_project_dir).is_dir():
+        error_msg = (
+            f"Invalid project_dir: '{raw_project_dir}' resolved to "
+            f"'{resolved_project_dir}', which is not an existing directory."
+        )
+        logger.error(error_msg)
+        return DbtRunResult(
+            is_success=False,
+            return_code=2,
+            stdout="",
+            stderr=error_msg,
+        )
+
+    full_command: List[str] = []
+    idx = 0
+    while idx < len(command):
+        token = command[idx]
+        if token == "--project-dir":
+            idx += 2
+            continue
+        if token.startswith("--project-dir="):
+            idx += 1
+            continue
+        full_command.append(token)
+        idx += 1
+
+    full_command += ["--project-dir", resolved_project_dir]
+
     if profiles_dir:
-        full_command += ["--profiles-dir", profiles_dir]
+        resolved_profiles_dir = str(Path(profiles_dir).expanduser().resolve())
+        full_command += ["--profiles-dir", resolved_profiles_dir]
+        logger.info(f"Using profiles dir: {resolved_profiles_dir}")
 
     logger.info(f"Running dbt command: {' '.join(full_command)}")
-    logger.info(f"Using project dir: {project_dir}")
+    logger.info(f"Using project dir: {resolved_project_dir}")
 
     result = subprocess.run(
         full_command,
-        cwd=project_dir,
+        cwd=resolved_project_dir,
         capture_output=True,
         text=True,
         check=False,
