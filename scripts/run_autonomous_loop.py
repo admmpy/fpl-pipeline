@@ -62,7 +62,7 @@ def main() -> int:
     }
     print(json.dumps(output, indent=2, sort_keys=True))
 
-    return 0 if final_state.get("state") in {"RECORDED", "FAILED"} else 1
+    return 0 if final_state.get("state") == "RECORDED" else 1
 
 
 if __name__ == "__main__":

@@ -35,7 +35,7 @@ DEFAULT_ACTIVE_MODEL_PATH = DEFAULT_LOGS_DIR / "model.bin"
 def _ensure_allowlisted(path: Path, logs_root: Path) -> Path:
     resolved = path.resolve()
     logs_resolved = logs_root.resolve()
-    if not str(resolved).startswith(str(logs_resolved)):
+    if resolved != logs_resolved and logs_resolved not in resolved.parents:
         raise RegistryError(f"Path '{resolved}' is outside allowlisted logs root '{logs_resolved}'")
     return resolved
 

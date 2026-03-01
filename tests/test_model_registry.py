@@ -107,3 +107,13 @@ def test_rollback_to_specific_version(tmp_path):
     assert active is not None
     assert active["version"] == v1["version"]
     assert Path(active["path"]).exists()
+
+
+def test_allowlist_rejects_prefix_path_bypass(tmp_path):
+    logs_dir = tmp_path / "logs"
+    bypass_path = tmp_path / "logs_evil" / "model.bin"
+    bypass_path.parent.mkdir(parents=True, exist_ok=True)
+    bypass_path.write_bytes(b"payload")
+
+    with pytest.raises(model_registry.RegistryError):
+        model_registry._ensure_allowlisted(bypass_path, logs_dir)
