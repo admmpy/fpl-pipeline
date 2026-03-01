@@ -231,6 +231,7 @@ FIXTURE_SCHEMA = {
 RECOMMENDED_SQUAD_SCHEMA = {
     "recommendation_key": "VARCHAR(100) NOT NULL",
     "recommended_at": "TIMESTAMP_NTZ",
+    "backfill_method": "VARCHAR(100)",
     "player_id": "INTEGER",
     "web_name": "VARCHAR(100)",
     "position_id": "INTEGER",
