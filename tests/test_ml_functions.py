@@ -177,6 +177,16 @@ class TestFeatureEngineeringGuards:
     def test_form_removed_from_feature_selection(self):
         assert "form" not in select_features()
 
+    def test_shared_no_minute_bands_removes_bucket_features(self):
+        features = select_features("shared_no_minute_bands")
+        assert "minutes_band_0_30" not in features
+        assert "minutes_played" in features
+
+    def test_shared_upside_features_adds_delta_and_per90_features(self):
+        features = select_features("shared_upside_features")
+        assert "goals_scored_per90" in features
+        assert "player_points_roll_delta_3v5" in features
+
     def test_collapses_double_gameweek_rows_before_target_shift(self):
         df = pd.DataFrame(
             {

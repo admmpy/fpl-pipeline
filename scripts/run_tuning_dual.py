@@ -31,6 +31,18 @@ def main():
         default=10,
         help="Maximum number of tuning iterations (default: 10)",
     )
+    parser.add_argument(
+        "--rules-path",
+        type=str,
+        default="config/domain_rules.yaml",
+        help="Domain rules path used for gameweek quality policy",
+    )
+    parser.add_argument(
+        "--experiment-variant",
+        type=str,
+        default=None,
+        help="Optional experiment variant passed through to feature/model selection",
+    )
     args = parser.parse_args()
 
     env_path = os.path.join(os.path.dirname(__file__), "..", ".env")
@@ -44,6 +56,9 @@ def main():
     logger.info("FPL DUAL-AGENT TUNING WORKFLOW")
     logger.info("=" * 60)
     logger.info(f"Max iterations: {args.max_iterations}")
+    os.environ["DOMAIN_RULES_PATH"] = args.rules_path
+    if args.experiment_variant:
+        os.environ["EXPERIMENT_VARIANT"] = args.experiment_variant
 
     from agents.tuning_graph_dual import build_tuning_graph_dual
 

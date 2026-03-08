@@ -225,8 +225,8 @@ def run_ml_inference(df: pd.DataFrame, model_path: str = "logs/model.bin") -> Li
             model = model_payload
             metadata = {}
 
-        if not hasattr(model, 'predict'):
-            logger.error("Loaded model object does not have a predict method")
+        if not isinstance(model, dict) and not hasattr(model, 'predict'):
+            logger.error("Loaded model object does not expose a supported prediction interface")
             return []
         
         # Define default feature set (overridden by model metadata if present)
@@ -256,8 +256,7 @@ def run_ml_inference(df: pd.DataFrame, model_path: str = "logs/model.bin") -> Li
             )
             return []
         
-        # Engineer additional features needed for inference
-        # Position encoding
+        # Engineer additional features needed for inference.
         df['is_gk'] = (df['position_id'] == 1).astype(int)
         df['is_def'] = (df['position_id'] == 2).astype(int)
         df['is_mid'] = (df['position_id'] == 3).astype(int)
@@ -274,6 +273,7 @@ def run_ml_inference(df: pd.DataFrame, model_path: str = "logs/model.bin") -> Li
                 col = f'minutes_band_{label}'
                 if col not in df.columns:
                     df[col] = (minute_band == label).astype(int)
+        df = train_model.engineer_upside_features(df)
 
         # Apply global z-scores using training stats, if available
         zscore_features = ['total_points', 'minutes_played', 'ict_index']
@@ -299,14 +299,16 @@ def run_ml_inference(df: pd.DataFrame, model_path: str = "logs/model.bin") -> Li
         latest_stats = df.sort_values('gameweek_id').groupby('player_id').tail(1).copy()
         
         # Make predictions
-        X_inference = latest_stats[available_features].fillna(0)
         try:
-            predictions_array = model.predict(X_inference)
+            predictions_array = train_model.predict_prediction_bundle(
+                model,
+                latest_stats,
+                available_features,
+                use_log_target=bool(metadata.get("use_log_target", False)),
+            )
         except Exception as exc:
             logger.error(f"model.predict() failed: {exc}")
             return []
-        if bool(metadata.get("use_log_target", False)):
-            predictions_array = train_model._inverse_transform(np.asarray(predictions_array))
 
         league_mean = metadata.get('league_mean')
         shrinkage_alpha = metadata.get('shrinkage_alpha', DEFAULT_SHRINKAGE_ALPHA)

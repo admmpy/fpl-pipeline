@@ -1,4 +1,4 @@
-version: "1.0.0"
+version: "1.2.0"
 schema:
   required_columns:
     - player_id
@@ -33,6 +33,15 @@ split:
     source_column: gameweek_id
     target_column: target_gameweek_id
     allow_equal: true
+gameweek_quality:
+  policy_version: "2026-03-08"
+  excluded_gameweeks: []
+  backfilled_but_untrusted_gameweeks: []
+  trusted_backfilled_gameweeks:
+    - 27
+    - 28
+  eligible_training_gameweeks: []
+  eligible_holdout_backtest_gameweeks: []
 drift:
   columns:
     - total_points
@@ -50,3 +59,18 @@ model:
   max_position_exceed_rate: 0.1
   max_player_exceed_rate: 0.1
   rmse_deterioration_pct: 0.03
+  max_squad_total_bias: 16.0
+  max_position_bias: 2.5
+  min_top_k_hit_rate: 0.25
+  min_rank_correlation: 0.0
+  max_selected_xi_regret: 24.0
+  max_prediction_collapse_weeks: 0
+  max_bias_flip_weeks: 0
+  instability_bias_abs_threshold: 10.0
+  min_prediction_to_actual_ratio: 0.6
+  max_prediction_to_actual_ratio: 1.6
+  required_baseline: five_week_players_roll_avg_points
+  baseline_gate_metrics:
+    - top_k_hit_rate_mean
+    - selected_xi_regret_mean
+  min_position_calibration_gain: 0.0

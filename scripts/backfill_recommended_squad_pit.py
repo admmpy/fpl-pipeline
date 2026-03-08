@@ -135,7 +135,8 @@ def _prepare_training_data(feature_df: pd.DataFrame, target_gw: int) -> tuple[pd
     zscore_stats = train_model.compute_global_stats(train_df)
     train_df = train_model.add_z_scores(train_df, zscore_stats)
 
-    feature_cols = train_model.select_features()
+    experiment_variant = train_model.resolve_experiment_variant()
+    feature_cols = train_model.select_features(experiment_variant)
     missing_features = [f for f in feature_cols if f not in train_df.columns]
     for feature in missing_features:
         train_df[feature] = 0
@@ -147,9 +148,14 @@ def _train_point_in_time_model(
     train_df: pd.DataFrame,
     feature_cols: List[str],
 ) -> tuple[Any, dict[str, Any]]:
-    X_train = train_df[feature_cols]
     y_train = train_df["target_next_gw_points"]
-    model = train_model.train_xgboost_model(X_train, y_train)
+    experiment_variant = train_model.resolve_experiment_variant()
+    model = train_model.train_prediction_bundle(
+        train_df,
+        feature_cols,
+        variant=experiment_variant,
+        use_log_target=bool(train_model.LOG_TARGET),
+    )
     position_caps = {}
     if "position_id" in train_df.columns:
         for position_id, group in train_df.groupby("position_id"):
@@ -162,6 +168,7 @@ def _train_point_in_time_model(
         "position_calibration": None,
         "position_caps": position_caps,
         "use_log_target": bool(train_model.LOG_TARGET),
+        "experiment_variant": experiment_variant,
     }
     return model, metadata
 
@@ -184,6 +191,7 @@ def _build_predictions_for_target_gw(
     inference_df["is_mid"] = (inference_df["position_id"] == 3).astype(int)
     inference_df["is_fwd"] = (inference_df["position_id"] == 4).astype(int)
     inference_df = _add_minutes_band_features(inference_df)
+    inference_df = train_model.engineer_upside_features(inference_df)
     inference_df = ensure_z_score_columns(
         inference_df,
         train_model.FEATURES_TO_SCALE,
@@ -196,10 +204,12 @@ def _build_predictions_for_target_gw(
         if feature not in latest_stats.columns:
             latest_stats[feature] = 0
 
-    X_inference = latest_stats[feature_cols].fillna(0)
-    preds = model.predict(X_inference)
-    if bool(metadata.get("use_log_target", False)):
-        preds = train_model._inverse_transform(preds)  # Existing helper from training module
+    preds = train_model.predict_prediction_bundle(
+        model,
+        latest_stats,
+        feature_cols,
+        use_log_target=bool(metadata.get("use_log_target", False)),
+    )
     preds = train_model.apply_prediction_post_processing(
         preds,
         league_mean=metadata.get("league_mean"),

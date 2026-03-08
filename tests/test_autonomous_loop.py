@@ -152,7 +152,13 @@ def test_validation_failure_routes_to_record_evidence_without_drift_node_error(t
 
 def test_drift_path_can_promote_deterministically(tmp_path, monkeypatch):
     logs_dir = _patch_runtime_dirs(monkeypatch, tmp_path)
-    rules_path = _rules_file(tmp_path, mutate={"optimisation.optuna_trials": 2})
+    rules_path = _rules_file(
+        tmp_path,
+        mutate={
+            "optimisation.optuna_trials": 2,
+            "model.required_baseline": "synthetic_baseline_not_present",
+        },
+    )
 
     graph = build_autonomous_graph()
     state = create_initial_state(
@@ -200,9 +206,92 @@ def test_drift_path_can_reject_deterministically(tmp_path, monkeypatch):
     assert final_state["promotion_decision"]["decision"] == "reject"
 
 
+def test_gameweek_quality_exclusions_applied_in_split(tmp_path, monkeypatch):
+    _patch_runtime_dirs(monkeypatch, tmp_path)
+    rules_path = _rules_file(
+        tmp_path,
+        mutate={
+            "gameweek_quality.excluded_gameweeks": [13],
+            "gameweek_quality.backfilled_but_untrusted_gameweeks": [],
+        },
+    )
+
+    graph = build_autonomous_graph()
+    state = create_initial_state(
+        "run-quality-filter",
+        snapshot_meta={
+            "dataframe": _dataset(),
+            "rules_path": str(rules_path),
+            "force_drift": True,
+        },
+    )
+
+    final_state = graph.invoke(state)
+    holdout_df = final_state["snapshot_meta"]["holdout_df"]
+    train_df = final_state["snapshot_meta"]["train_df"]
+
+    assert 13 not in set(holdout_df["target_gameweek_id"].unique())
+    assert 13 not in set(train_df["target_gameweek_id"].unique())
+
+
+def test_candidate_evidence_includes_weekly_and_position_metrics(tmp_path, monkeypatch):
+    _patch_runtime_dirs(monkeypatch, tmp_path)
+    rules_path = _rules_file(tmp_path, mutate={"optimisation.optuna_trials": 2})
+
+    graph = build_autonomous_graph()
+    state = create_initial_state(
+        "run-weekly-metrics",
+        snapshot_meta={
+            "dataframe": _dataset(),
+            "rules_path": str(rules_path),
+            "force_drift": True,
+        },
+    )
+
+    final_state = graph.invoke(state)
+    candidate = final_state["candidate_metrics"]["candidate"]
+
+    assert "backtest_summary" in candidate
+    assert "backtest_per_position" in candidate
+    assert "prediction_collapse_weeks" in candidate["backtest_summary"]
+    assert "calibration_report" in candidate
+
+
+def test_prediction_collapse_gate_rejects_when_ratio_outside_bounds(tmp_path, monkeypatch):
+    _patch_runtime_dirs(monkeypatch, tmp_path)
+    rules_path = _rules_file(
+        tmp_path,
+        mutate={
+            "optimisation.optuna_trials": 2,
+            "model.min_prediction_to_actual_ratio": 2.0,
+        },
+    )
+
+    graph = build_autonomous_graph()
+    state = create_initial_state(
+        "run-collapse-reject",
+        snapshot_meta={
+            "dataframe": _dataset(),
+            "rules_path": str(rules_path),
+            "force_drift": True,
+        },
+    )
+
+    final_state = graph.invoke(state)
+    assert final_state["state"] == "RECORDED"
+    assert final_state["rule_eval"]["gates"]["prediction_ratio_min"] is False
+    assert final_state["promotion_decision"]["decision"] == "reject"
+
+
 def test_inference_compatibility_reads_active_model_bin(tmp_path, monkeypatch):
     logs_dir = _patch_runtime_dirs(monkeypatch, tmp_path)
-    rules_path = _rules_file(tmp_path, mutate={"optimisation.optuna_trials": 2})
+    rules_path = _rules_file(
+        tmp_path,
+        mutate={
+            "optimisation.optuna_trials": 2,
+            "model.required_baseline": "synthetic_baseline_not_present",
+        },
+    )
 
     graph = build_autonomous_graph()
     state = create_initial_state(

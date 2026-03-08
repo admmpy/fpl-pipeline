@@ -181,18 +181,49 @@ def _compute_sanity_metrics(
     }
 
 
+def _balanced_candidate_score(holdout_mae: float, backtest_summary: dict) -> float:
+    """Lower is better; penalise realism/ranking degradation."""
+
+    score = float(holdout_mae)
+    score += 0.05 * float(backtest_summary.get("squad_total_bias_abs_mean", 0.0))
+    score += 0.03 * float(backtest_summary.get("selected_xi_regret_mean", 0.0))
+    score += 1.5 * max(0.0, 0.30 - float(backtest_summary.get("top_k_hit_rate_mean", 0.0)))
+    score += 1.0 * max(0.0, 0.10 - float(backtest_summary.get("rank_correlation_mean", 0.0)))
+    score += 2.0 * float(backtest_summary.get("prediction_collapse_weeks", 0))
+    return float(score)
+
+
 def _evaluate_gates(
     holdout_mae: float,
     holdout_rmse: float,
     holdout_bias: float,
     sanity_metrics: dict,
+    backtest_summary: dict,
     best_holdout_mae: float,
     best_holdout_rmse: float,
+    best_candidate_score: float | tuple[float, ...] | list[float],
+    candidate_score: float | tuple[float, ...] | list[float],
 ) -> Tuple[bool, dict]:
+    model_rules = train_model.load_model_rules(os.environ.get("DOMAIN_RULES_PATH", "config/domain_rules.yaml"))
+    if "summary" in backtest_summary:
+        backtest_report = backtest_summary
+        backtest_summary = backtest_report.get("summary") or {}
+    else:
+        backtest_report = {"summary": backtest_summary}
+    required_baseline = backtest_report.get("required_baseline_comparison") or {}
+    best_candidate_priority = tuple(best_candidate_score) if isinstance(best_candidate_score, (tuple, list)) else tuple()
+    candidate_priority = tuple(candidate_score) if isinstance(candidate_score, (tuple, list)) else tuple()
     bias_sd_mult = _env_float("TUNING_BIAS_SD_MULT", 0.25)
     pos_exceed_pct = _env_float("TUNING_POS_P95_EXCEED_PCT", 0.05)
     player_exceed_pct = _env_float("TUNING_PLAYER_P95_EXCEED_PCT", 0.05)
     rmse_worse_pct = _env_float("TUNING_RMSE_WORSE_PCT", 0.05)
+    max_squad_bias = float(model_rules.get("max_squad_total_bias", 16.0))
+    max_position_bias = float(model_rules.get("max_position_bias", 2.5))
+    min_top_k_hit = float(model_rules.get("min_top_k_hit_rate", 0.25))
+    min_rank_corr = float(model_rules.get("min_rank_correlation", 0.0))
+    max_xi_regret = float(model_rules.get("max_selected_xi_regret", 24.0))
+    max_collapse_weeks = int(model_rules.get("max_prediction_collapse_weeks", 0))
+    max_bias_flip_weeks = int(model_rules.get("max_bias_flip_weeks", 0))
 
     actual_std = sanity_metrics.get("actual_stats", {}).get("std", 0.0)
     bias_gate = abs(holdout_bias) <= bias_sd_mult * actual_std if actual_std > 0 else True
@@ -219,19 +250,57 @@ def _evaluate_gates(
     else:
         mae_gate = True
 
+    realism_gate = float(backtest_summary.get("squad_total_bias_abs_mean", 0.0)) <= max_squad_bias
+    position_bias_gate = float(backtest_summary.get("max_position_bias_abs", 0.0)) <= max_position_bias
+    ranking_gate = float(backtest_summary.get("top_k_hit_rate_mean", 0.0)) >= min_top_k_hit
+    corr_gate = float(backtest_summary.get("rank_correlation_mean", 0.0)) >= min_rank_corr
+    regret_gate = float(backtest_summary.get("selected_xi_regret_mean", 0.0)) <= max_xi_regret
+    collapse_gate = int(backtest_summary.get("prediction_collapse_weeks", 0)) <= max_collapse_weeks
+    instability_gate = int(backtest_summary.get("bias_flip_weeks", 0)) <= max_bias_flip_weeks
+    baseline_gate = bool(required_baseline.get("baseline_gate_passed", True))
+    priority_gate = candidate_priority <= best_candidate_priority if best_candidate_priority else True
+
     gates = {
         "bias_gate": bias_gate,
         "pos_cap_gate": pos_gate,
         "player_cap_gate": player_gate,
         "rmse_gate": rmse_gate,
         "mae_gate": mae_gate,
+        "realism_gate": realism_gate,
+        "position_bias_gate": position_bias_gate,
+        "ranking_gate": ranking_gate,
+        "rank_corr_gate": corr_gate,
+        "xi_regret_gate": regret_gate,
+        "collapse_gate": collapse_gate,
+        "instability_gate": instability_gate,
+        "baseline_gate": baseline_gate,
+        "priority_gate": priority_gate,
         "bias_sd_mult": bias_sd_mult,
         "pos_exceed_pct": pos_exceed_pct,
         "player_exceed_pct": player_exceed_pct,
         "rmse_worse_pct": rmse_worse_pct,
+        "candidate_priority": list(candidate_priority),
+        "best_candidate_priority": list(best_candidate_priority),
     }
 
-    gates_passed = all([bias_gate, pos_gate, player_gate, rmse_gate, mae_gate])
+    gates_passed = all(
+        [
+            bias_gate,
+            pos_gate,
+            player_gate,
+            rmse_gate,
+            mae_gate,
+            realism_gate,
+            position_bias_gate,
+            ranking_gate,
+            corr_gate,
+            regret_gate,
+            collapse_gate,
+            instability_gate,
+            baseline_gate,
+            priority_gate,
+        ]
+    )
     return gates_passed, gates
 
 
@@ -245,6 +314,8 @@ def fetch_data(state: TuningState) -> dict:
     base.update(
         {
             "best_holdout_rmse": float("inf"),
+            "best_candidate_score": float("inf"),
+            "best_candidate_priority": [],
             "sanity_metrics": {},
             "gates_passed": False,
             "gate_details": {},
@@ -312,17 +383,48 @@ def train_evaluate(state: TuningState) -> dict:
     model.fit(X_train, y_train_trans)
 
     league_mean = float(y_train.mean())
-    holdout_pred = model.predict(X_holdout)
+    holdout_pred_raw = model.predict(X_holdout)
     if use_log_target:
-        holdout_pred = _inverse_transform(holdout_pred)
-    holdout_pred = train_model.apply_shrinkage(holdout_pred, league_mean, shrinkage_alpha)
+        holdout_pred_raw = _inverse_transform(holdout_pred_raw)
+    holdout_pred_raw = train_model.apply_shrinkage(holdout_pred_raw, league_mean, shrinkage_alpha)
 
+    train_pred_raw = model.predict(X_train)
+    if use_log_target:
+        train_pred_raw = _inverse_transform(train_pred_raw)
+    train_pred_raw = train_model.apply_shrinkage(train_pred_raw, league_mean, shrinkage_alpha)
+
+    holdout_pred = np.asarray(holdout_pred_raw)
     if calibration_strength > 0:
-        a, b = train_model.fit_calibration(y_holdout.to_numpy(), holdout_pred)
+        a, b = train_model.fit_calibration(y_train.to_numpy(), np.asarray(train_pred_raw))
         a, b = train_model.blend_calibration(a, b, calibration_strength)
-        holdout_pred = train_model.apply_calibration(holdout_pred, a, b)
+        holdout_global = train_model.apply_calibration(np.asarray(holdout_pred_raw), a, b)
+        holdout_pred = holdout_global
+        if "position_id" in train_df.columns and "position_id" in holdout_df.columns:
+            position_payload = train_model.fit_position_aware_calibration(
+                y_train.to_numpy(),
+                np.asarray(train_pred_raw),
+                train_df["position_id"].to_numpy(),
+                strength=calibration_strength,
+            )
+            holdout_position = train_model.apply_position_aware_calibration(
+                np.asarray(holdout_pred_raw),
+                holdout_df["position_id"].to_numpy(),
+                position_payload,
+            )
+            global_abs = train_model.compute_focus_position_abs_bias(
+                holdout_df["position_id"].to_numpy(),
+                y_holdout.to_numpy(),
+                holdout_global,
+            )
+            position_abs = train_model.compute_focus_position_abs_bias(
+                holdout_df["position_id"].to_numpy(),
+                y_holdout.to_numpy(),
+                holdout_position,
+            )
+            if position_abs <= global_abs:
+                holdout_pred = holdout_position
 
-    holdout_pred = np.maximum(holdout_pred, 0)
+    holdout_pred = np.maximum(np.asarray(holdout_pred), 0)
 
     holdout_mae = float(mean_absolute_error(y_holdout, holdout_pred))
     holdout_rmse = float(np.sqrt(mean_squared_error(y_holdout, holdout_pred)))
@@ -332,14 +434,41 @@ def train_evaluate(state: TuningState) -> dict:
         f"Holdout MAE: {holdout_mae:.4f}  RMSE: {holdout_rmse:.4f}  Bias: {holdout_bias:.4f}"
     )
 
+    backtest_report = train_model.build_weekly_backtest_report(
+        holdout_df,
+        y_holdout.to_numpy(),
+        holdout_pred,
+        gameweek_policy=state.get("gameweek_policy"),
+        model_rules=train_model.load_model_rules(os.environ.get("DOMAIN_RULES_PATH", "config/domain_rules.yaml")),
+    )
+    backtest_report = train_model.add_baseline_comparison_to_report(
+        backtest_report,
+        holdout_df.assign(predicted_points=holdout_pred),
+        y_holdout.to_numpy(),
+        gameweek_policy=state.get("gameweek_policy"),
+        model_rules=train_model.load_model_rules(os.environ.get("DOMAIN_RULES_PATH", "config/domain_rules.yaml")),
+    )
+    backtest_summary = backtest_report["summary"]
+    candidate_score = _balanced_candidate_score(holdout_mae, backtest_summary)
+    candidate_priority = train_model.ranking_candidate_priority(
+        {
+            **backtest_summary,
+            "mae": holdout_mae,
+            "rmse": holdout_rmse,
+        }
+    )
+
     sanity_metrics = _compute_sanity_metrics(train_df, holdout_df, y_holdout, holdout_pred)
     gates_passed, gate_details = _evaluate_gates(
         holdout_mae,
         holdout_rmse,
         holdout_bias,
         sanity_metrics,
+        backtest_report,
         state["best_holdout_mae"],
         state.get("best_holdout_rmse", float("inf")),
+        tuple(state.get("best_candidate_priority", ())),
+        candidate_priority,
     )
 
     experiment = {
@@ -349,6 +478,10 @@ def train_evaluate(state: TuningState) -> dict:
         "holdout_mae": holdout_mae,
         "holdout_rmse": holdout_rmse,
         "holdout_bias": holdout_bias,
+        "candidate_score": float(candidate_score),
+        "candidate_priority": list(candidate_priority),
+        "backtest_summary": backtest_summary,
+        "baseline_comparison": backtest_report.get("baseline_comparison", {}),
         "gates_passed": gates_passed,
         "gate_details": gate_details,
     }
@@ -358,12 +491,20 @@ def train_evaluate(state: TuningState) -> dict:
     best_params = state["best_params"]
     best_holdout_mae = state["best_holdout_mae"]
     best_holdout_rmse = state.get("best_holdout_rmse", float("inf"))
+    best_candidate_score = state.get("best_candidate_score", float("inf"))
+    best_candidate_priority = tuple(state.get("best_candidate_priority", ()))
 
-    if gates_passed and holdout_mae < best_holdout_mae:
+    if gates_passed and (not best_candidate_priority or candidate_priority < best_candidate_priority):
         best_params = params.copy()
         best_holdout_mae = holdout_mae
         best_holdout_rmse = holdout_rmse
-        logger.info(f"*** New best feasible holdout MAE: {holdout_mae:.4f} ***")
+        best_candidate_score = candidate_score
+        best_candidate_priority = candidate_priority
+        logger.info(
+            "*** New best feasible candidate: priority=%s holdout_mae=%.4f ***",
+            list(candidate_priority),
+            holdout_mae,
+        )
     elif not gates_passed:
         logger.info("Gates failed. Not updating best params.")
 
@@ -373,6 +514,8 @@ def train_evaluate(state: TuningState) -> dict:
         "best_params": best_params,
         "best_holdout_mae": best_holdout_mae,
         "best_holdout_rmse": best_holdout_rmse,
+        "best_candidate_score": best_candidate_score,
+        "best_candidate_priority": list(best_candidate_priority),
         "sanity_metrics": sanity_metrics,
         "gates_passed": gates_passed,
         "gate_details": gate_details,

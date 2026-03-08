@@ -33,6 +33,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--force-drift", action="store_true")
     parser.add_argument("--force-no-drift", action="store_true")
     parser.add_argument("--optuna-trials", type=int, default=None)
+    parser.add_argument("--experiment-variant", default=None)
     return parser.parse_args()
 
 
@@ -44,6 +45,8 @@ def main() -> int:
     except DomainRulesError as exc:
         print(f"Rules validation failed before run start: {exc}", file=sys.stderr)
         return 2
+
+    os.environ["DOMAIN_RULES_PATH"] = args.rules_path
 
     snapshot_meta = {
         "rules_path": str(Path(args.rules_path)),
@@ -60,6 +63,10 @@ def main() -> int:
         snapshot_meta["data_policy"] = args.data_policy
     if args.optuna_trials:
         snapshot_meta["optuna_trials"] = args.optuna_trials
+    experiment_variant = getattr(args, "experiment_variant", None)
+    if experiment_variant:
+        snapshot_meta["experiment_variant"] = experiment_variant
+        os.environ["EXPERIMENT_VARIANT"] = experiment_variant
 
     graph = build_autonomous_graph()
     state = create_initial_state(run_id=args.run_id, snapshot_meta=snapshot_meta)

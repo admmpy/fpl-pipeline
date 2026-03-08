@@ -12,6 +12,8 @@ class TuningState(TypedDict):
     holdout_df: Annotated[Optional[pd.DataFrame], "Holdout data"]
     features: list[str]
     global_stats: dict
+    gameweek_policy: dict
+    experiment_variant: str
 
     # Experiment tracking
     experiments: list[dict]  # [{params, cv_mae, holdout_mae, holdout_rmse, holdout_bias, iteration}]
@@ -19,6 +21,8 @@ class TuningState(TypedDict):
     best_params: dict
     best_holdout_mae: float
     best_holdout_rmse: float
+    best_candidate_score: float
+    best_candidate_priority: list[float]
 
     # Control
     iteration: int

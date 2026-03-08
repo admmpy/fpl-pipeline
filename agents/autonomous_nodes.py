@@ -300,7 +300,8 @@ def _prepare_train_holdout(
     train_df = train_model.add_z_scores(train_df, global_stats)
     holdout_df = train_model.add_z_scores(holdout_df, global_stats)
 
-    features = train_model.select_features()
+    experiment_variant = train_model.resolve_experiment_variant()
+    features = train_model.select_features(experiment_variant)
     for feature in features:
         if feature not in train_df.columns:
             train_df[feature] = 0
@@ -328,7 +329,7 @@ def _fit_predict(
     *,
     gameweek_policy: Optional[dict[str, Any]] = None,
     model_rules: Optional[dict[str, Any]] = None,
-) -> tuple[xgb.XGBRegressor, np.ndarray, dict[str, Any]]:
+) -> tuple[Any, np.ndarray, dict[str, Any]]:
     X_train = train_df[features].fillna(0)
     y_train = train_df["target_next_gw_points"]
     X_holdout = holdout_df[features].fillna(0)
@@ -354,21 +355,22 @@ def _fit_predict(
         "eval_metric": "mae",
     }
 
-    model = xgb.XGBRegressor(**xgb_params)
-
     use_log_target = os.environ.get("TUNING_LOG_TARGET", "1").lower() in {"1", "true", "yes"}
-    y_train_trans = train_model._transform_target(y_train) if use_log_target else y_train
-    model.fit(X_train, y_train_trans)
+    experiment_variant = train_model.resolve_experiment_variant()
+    model = train_model.train_prediction_bundle(
+        train_df,
+        features,
+        variant=experiment_variant,
+        params=xgb_params,
+        use_log_target=use_log_target,
+    )
 
-    holdout_pred = model.predict(X_holdout)
-    if use_log_target:
-        holdout_pred = train_model._inverse_transform(holdout_pred)
-    holdout_pred = np.asarray(holdout_pred)
-
-    train_pred = model.predict(X_train)
-    if use_log_target:
-        train_pred = train_model._inverse_transform(train_pred)
-    train_pred = np.asarray(train_pred)
+    holdout_pred = np.asarray(
+        train_model.predict_prediction_bundle(model, holdout_df, features, use_log_target=use_log_target)
+    )
+    train_pred = np.asarray(
+        train_model.predict_prediction_bundle(model, train_df, features, use_log_target=use_log_target)
+    )
 
     league_mean = float(y_train.mean())
     holdout_pred = train_model.apply_shrinkage(holdout_pred, league_mean, shrinkage_alpha)
@@ -405,10 +407,18 @@ def _fit_predict(
         gameweek_policy=gameweek_policy,
         model_rules=model_rules,
     )
+    backtest = train_model.add_baseline_comparison_to_report(
+        backtest,
+        holdout_df.assign(predicted_points=holdout_pred),
+        y_holdout.to_numpy(),
+        gameweek_policy=gameweek_policy,
+        model_rules=model_rules,
+    )
 
     post = {
         "league_mean": league_mean,
         "shrinkage_alpha": shrinkage_alpha,
+        "experiment_variant": experiment_variant,
         "calibration": calibration_payload,
         "position_calibration": position_calibration_payload,
         "selected_calibration_variant": selected_variant,
@@ -435,14 +445,16 @@ def _evaluate_payload(
         model = payload
         metadata = {}
 
-    if model is None or not hasattr(model, "predict"):
+    if model is None:
         raise ValueError("Active model payload is invalid")
 
-    X_holdout = holdout_df[features].fillna(0)
     y_holdout = holdout_df["target_next_gw_points"]
-    pred = model.predict(X_holdout)
-    if bool(metadata.get("use_log_target", False)):
-        pred = train_model._inverse_transform(np.asarray(pred))
+    pred = train_model.predict_prediction_bundle(
+        model,
+        holdout_df,
+        features,
+        use_log_target=bool(metadata.get("use_log_target", False)),
+    )
 
     pred = train_model.apply_prediction_post_processing(
         np.asarray(pred),
@@ -458,6 +470,13 @@ def _evaluate_payload(
         holdout_df,
         y_holdout.to_numpy(),
         pred,
+        gameweek_policy=gameweek_policy,
+        model_rules=model_rules,
+    )
+    backtest = train_model.add_baseline_comparison_to_report(
+        backtest,
+        holdout_df.assign(predicted_points=pred),
+        y_holdout.to_numpy(),
         gameweek_policy=gameweek_policy,
         model_rules=model_rules,
     )
@@ -916,6 +935,9 @@ def train_best_candidate(state: AutonomousState) -> dict[str, Any]:
                 "position_calibration": post.get("position_calibration"),
                 "calibration_report": post.get("calibration_report", {}),
                 "evaluation_window_summary": (post.get("backtest") or {}).get("summary", {}),
+                "baseline_comparison": (post.get("backtest") or {}).get("baseline_comparison", {}),
+                "recent_validation_gameweeks": (post.get("backtest") or {}).get("recent_validation_gameweeks", []),
+                "experiment_variant": post.get("experiment_variant", train_model.DEFAULT_EXPERIMENT_VARIANT),
                 "trusted_gameweek_policy_version": gameweek_policy.get("policy_version"),
                 "use_log_target": post["use_log_target"],
             },
@@ -979,9 +1001,18 @@ def evaluate_candidate(state: AutonomousState) -> dict[str, Any]:
             gameweek_policy=gameweek_policy,
             model_rules=model_rules,
         )
+        candidate_backtest = train_model.add_baseline_comparison_to_report(
+            candidate_backtest,
+            holdout_df.assign(predicted_points=holdout_pred_arr),
+            y_holdout.to_numpy(),
+            gameweek_policy=gameweek_policy,
+            model_rules=model_rules,
+        )
         candidate_summary = dict(candidate_backtest.get("summary") or {})
         candidate_summary["mae"] = float(mean_absolute_error(y_holdout, holdout_pred_arr))
+        candidate_summary["rmse"] = float(np.sqrt(mean_squared_error(y_holdout, holdout_pred_arr)))
         candidate_score = _balanced_candidate_score(candidate_summary)
+        candidate_priority = train_model.ranking_candidate_priority(candidate_summary)
 
         _ensure_dirs()
         weekly_report_path = AUTONOMOUS_LOG_DIR / f"{run_id}.weekly_report.json"
@@ -999,6 +1030,7 @@ def evaluate_candidate(state: AutonomousState) -> dict[str, Any]:
             "backtest_summary": candidate_backtest.get("summary", {}),
             "backtest_per_position": candidate_backtest.get("per_position", []),
             "candidate_score": float(candidate_score),
+            "candidate_priority": list(candidate_priority),
             "weekly_report_path": str(weekly_report_path),
             "calibration_comparison": candidate_post.get("calibration_comparison", {}),
             "calibration_report": candidate_post.get("calibration_report", {}),
@@ -1026,9 +1058,12 @@ def evaluate_candidate(state: AutonomousState) -> dict[str, Any]:
             )
             active_summary = dict(active_baseline.get("summary") or {})
             active_summary["mae"] = float(active_baseline.get("mae", float("inf")))
+            active_summary["rmse"] = float(active_baseline.get("rmse", float("inf")))
             active_baseline["candidate_score"] = _balanced_candidate_score(active_summary)
+            active_baseline["candidate_priority"] = list(train_model.ranking_candidate_priority(active_summary))
         else:
             active_baseline["candidate_score"] = float("inf")
+            active_baseline["candidate_priority"] = []
 
         combined = {
             "candidate": candidate_metrics,
@@ -1076,6 +1111,8 @@ def apply_domain_rules(state: AutonomousState) -> dict[str, Any]:
         candidate_summary = candidate.get("backtest_summary") or {}
         calibration_comparison = candidate.get("calibration_comparison") or {}
         candidate_score = float(candidate.get("candidate_score", float("inf")))
+        candidate_priority = tuple(candidate.get("candidate_priority") or ())
+        required_baseline = (candidate.get("backtest") or {}).get("required_baseline_comparison") or {}
 
         per_week_rows = (candidate.get("backtest") or {}).get("per_week") or []
         prediction_ratios = [
@@ -1089,6 +1126,7 @@ def apply_domain_rules(state: AutonomousState) -> dict[str, Any]:
         active_mae = float(baseline.get("mae", float("inf")))
         active_rmse = float(baseline.get("rmse", float("inf")))
         active_score = float(baseline.get("candidate_score", float("inf")))
+        active_priority = tuple(baseline.get("candidate_priority") or ())
 
         position_calibration_gain = float(calibration_comparison.get("position_calibration_gain") or 0.0)
         if not np.isfinite(position_calibration_gain):
@@ -1122,6 +1160,12 @@ def apply_domain_rules(state: AutonomousState) -> dict[str, Any]:
             "position_calibration_gain": position_calibration_gain
             >= float(model_rules["min_position_calibration_gain"]),
             "mae_improves_active": candidate_mae < active_mae,
+            "ranking_priority_improves_active": (
+                True
+                if not active_priority
+                else candidate_priority < active_priority
+            ),
+            "baseline_gate_passed": bool(required_baseline.get("baseline_gate_passed", True)),
             "balanced_score_improves_active": candidate_score < active_score,
             "rmse_within_deterioration": (
                 True
