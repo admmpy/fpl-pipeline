@@ -173,13 +173,28 @@ def verify_artifact(path: str | Path, checksum: str) -> bool:
 
     model = payload.get("model") if isinstance(payload, dict) else payload
     metadata = payload.get("metadata", {}) if isinstance(payload, dict) else {}
-    if not hasattr(model, "predict"):
+    if not isinstance(model, dict) and not hasattr(model, "predict"):
         return False
 
     feature_cols = metadata.get("feature_cols") or []
     width = max(len(feature_cols), 1)
     frame = pd.DataFrame(np.zeros((1, width)), columns=feature_cols or ["feature_0"])
-    _ = model.predict(frame)
+    if isinstance(model, dict):
+        import sys
+
+        scripts_dir = Path(__file__).resolve().parents[1] / "scripts"
+        if str(scripts_dir) not in sys.path:
+            sys.path.insert(0, str(scripts_dir))
+        import train_model
+
+        _ = train_model.predict_prediction_bundle(
+            model,
+            frame,
+            feature_cols or ["feature_0"],
+            use_log_target=bool(metadata.get("use_log_target", False)),
+        )
+    else:
+        _ = model.predict(frame)
     return True
 
 

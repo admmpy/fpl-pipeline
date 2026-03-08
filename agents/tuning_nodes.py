@@ -21,6 +21,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 
 from agents.tuning_state import TuningState, SEARCH_SPACE, DEFAULT_PARAMS
 import train_model
+from utils.gameweek_quality import load_gameweek_quality_policy
 
 logger = logging.getLogger(__name__)
 
@@ -54,15 +55,20 @@ def fetch_data(state: TuningState) -> dict:
     df = train_model.fetch_training_data()
     df = train_model.engineer_features(df)
 
+    rules_path = os.environ.get("DOMAIN_RULES_PATH", "config/domain_rules.yaml")
+    gameweek_policy = load_gameweek_quality_policy(rules_path)
     train_df, holdout_df = train_model.split_train_holdout(
-        df, train_model.HOLDOUT_GAMEWEEKS
+        df,
+        train_model.HOLDOUT_GAMEWEEKS,
+        gameweek_policy=gameweek_policy,
     )
 
     global_stats = train_model.compute_global_stats(train_df)
     train_df = train_model.add_z_scores(train_df, global_stats)
     holdout_df = train_model.add_z_scores(holdout_df, global_stats)
 
-    features = train_model.select_features()
+    experiment_variant = train_model.resolve_experiment_variant()
+    features = train_model.select_features(experiment_variant)
 
     # Ensure all feature columns exist
     for feature in features:
@@ -80,6 +86,7 @@ def fetch_data(state: TuningState) -> dict:
         "holdout_df": holdout_df,
         "features": features,
         "global_stats": global_stats,
+        "gameweek_policy": gameweek_policy,
         "experiments": [],
         "current_params": DEFAULT_PARAMS.copy(),
         "best_params": DEFAULT_PARAMS.copy(),
@@ -87,6 +94,7 @@ def fetch_data(state: TuningState) -> dict:
         "iteration": 0,
         "converged": False,
         "analysis": "",
+        "experiment_variant": experiment_variant,
     }
 
 
@@ -123,46 +131,73 @@ def train_evaluate(state: TuningState) -> dict:
         if k not in ("shrinkage_alpha", "calibration_strength")
     }
 
-    model = xgb.XGBRegressor(
-        **xgb_params,
-        random_state=42,
-        n_jobs=-1,
-        objective="reg:squarederror",
-        eval_metric="mae",
-    )
-
     # Cross-validation
     use_log_target = _use_log_target()
-    y_train_trans = _transform_target(y_train) if use_log_target else y_train
+    experiment_variant = state.get("experiment_variant", train_model.DEFAULT_EXPERIMENT_VARIANT)
+    model = train_model.train_prediction_bundle(
+        train_df,
+        features,
+        variant=experiment_variant,
+        params=xgb_params,
+        use_log_target=use_log_target,
+    )
     tscv = TimeSeriesSplit(n_splits=5)
     cv_scores = []
     for train_idx, val_idx in tscv.split(X_train):
-        model_cv = xgb.XGBRegressor(**model.get_params())
-        model_cv.fit(X_train.iloc[train_idx], y_train_trans.iloc[train_idx])
-        preds = model_cv.predict(X_train.iloc[val_idx])
-        if use_log_target:
-            preds = _inverse_transform(preds)
+        cv_train = train_df.iloc[train_idx].copy()
+        cv_val = train_df.iloc[val_idx].copy()
+        model_cv = train_model.train_prediction_bundle(
+            cv_train,
+            features,
+            variant=experiment_variant,
+            params=xgb_params,
+            use_log_target=use_log_target,
+        )
+        preds = train_model.predict_prediction_bundle(
+            model_cv,
+            cv_val,
+            features,
+            use_log_target=use_log_target,
+        )
         cv_scores.append(mean_absolute_error(y_train.iloc[val_idx], preds))
     cv_mae = float(np.mean(cv_scores))
     cv_std = float(np.std(cv_scores))
     logger.info(f"CV MAE: {cv_mae:.4f} (+/- {cv_std:.4f})")
 
-    # Train on full training set
-    model.fit(X_train, y_train_trans)
-
     # Holdout evaluation with shrinkage + calibration
     league_mean = float(y_train.mean())
-    holdout_pred = model.predict(X_holdout)
-    if use_log_target:
-        holdout_pred = _inverse_transform(holdout_pred)
+    holdout_pred = train_model.predict_prediction_bundle(
+        model,
+        holdout_df,
+        features,
+        use_log_target=use_log_target,
+    )
     holdout_pred = train_model.apply_shrinkage(holdout_pred, league_mean, shrinkage_alpha)
+    holdout_pred_pre_calibration = np.asarray(holdout_pred).copy()
+    train_pred = train_model.predict_prediction_bundle(
+        model,
+        train_df,
+        features,
+        use_log_target=use_log_target,
+    )
+    train_pred = train_model.apply_shrinkage(train_pred, league_mean, shrinkage_alpha)
 
-    if calibration_strength > 0:
-        a, b = train_model.fit_calibration(y_holdout.to_numpy(), holdout_pred)
-        a, b = train_model.blend_calibration(a, b, calibration_strength)
-        holdout_pred = train_model.apply_calibration(holdout_pred, a, b)
-
-    holdout_pred = np.maximum(holdout_pred, 0)
+    calibration_result = train_model.select_calibration_variant(
+        y_train=y_train.to_numpy(),
+        train_pred=np.asarray(train_pred),
+        y_holdout=y_holdout.to_numpy(),
+        holdout_pred=np.asarray(holdout_pred),
+        train_position_ids=train_df["position_id"].to_numpy() if "position_id" in train_df.columns else None,
+        holdout_position_ids=holdout_df["position_id"].to_numpy() if "position_id" in holdout_df.columns else None,
+        strength=calibration_strength,
+    )
+    holdout_pred = train_model.apply_prediction_post_processing(
+        np.asarray(holdout_pred),
+        calibration=calibration_result["calibration"],
+        position_calibration=calibration_result["position_calibration"],
+        selected_variant=calibration_result["selected_variant"],
+        position_ids=holdout_df["position_id"].to_numpy() if "position_id" in holdout_df.columns else None,
+    )
 
     holdout_mae = float(mean_absolute_error(y_holdout, holdout_pred))
     holdout_rmse = float(np.sqrt(mean_squared_error(y_holdout, holdout_pred)))
@@ -174,6 +209,7 @@ def train_evaluate(state: TuningState) -> dict:
     experiment = {
         "iteration": iteration,
         "params": params.copy(),
+        "experiment_variant": experiment_variant,
         "cv_mae": cv_mae,
         "holdout_mae": holdout_mae,
         "holdout_rmse": holdout_rmse,
@@ -366,6 +402,7 @@ def save_best(state: TuningState) -> dict:
     holdout_df = state["holdout_df"]
     features = state["features"]
     global_stats = state["global_stats"]
+    gameweek_policy = state.get("gameweek_policy", {})
 
     logger.info(f"Best params: {json.dumps(best_params, indent=2)}")
     logger.info(f"Best holdout MAE: {state['best_holdout_mae']:.4f}")
@@ -408,13 +445,36 @@ def save_best(state: TuningState) -> dict:
     if use_log_target:
         holdout_pred = _inverse_transform(holdout_pred)
     holdout_pred = train_model.apply_shrinkage(holdout_pred, league_mean, shrinkage_alpha)
+    holdout_pred_pre_calibration = np.asarray(holdout_pred).copy()
 
-    calibration = None
-    if calibration_strength > 0:
-        a, b = train_model.fit_calibration(y_holdout.to_numpy(), holdout_pred)
-        a, b = train_model.blend_calibration(a, b, calibration_strength)
-        holdout_pred = train_model.apply_calibration(holdout_pred, a, b)
-        calibration = {"a": a, "b": b}
+    train_pred_raw = train_model.predict_prediction_bundle(
+        model,
+        train_df,
+        features,
+        use_log_target=use_log_target,
+    )
+    train_pred_raw = train_model.apply_shrinkage(train_pred_raw, league_mean, shrinkage_alpha)
+
+    calibration_result = train_model.select_calibration_variant(
+        y_train=y_train.to_numpy(),
+        train_pred=np.asarray(train_pred_raw),
+        y_holdout=y_holdout.to_numpy(),
+        holdout_pred=np.asarray(holdout_pred_pre_calibration),
+        train_position_ids=train_df["position_id"].to_numpy() if "position_id" in train_df.columns else None,
+        holdout_position_ids=holdout_df["position_id"].to_numpy() if "position_id" in holdout_df.columns else None,
+        strength=calibration_strength,
+    )
+    calibration = calibration_result["calibration"]
+    position_calibration = calibration_result["position_calibration"]
+    calibration_report = calibration_result["calibration_report"]
+    selected_variant = calibration_result["selected_variant"]
+    holdout_pred = train_model.apply_prediction_post_processing(
+        np.asarray(holdout_pred_pre_calibration),
+        calibration=calibration,
+        position_calibration=position_calibration,
+        selected_variant=selected_variant,
+        position_ids=holdout_df["position_id"].to_numpy() if "position_id" in holdout_df.columns else None,
+    )
 
     holdout_pred = np.maximum(holdout_pred, 0)
 
@@ -422,10 +482,29 @@ def save_best(state: TuningState) -> dict:
     holdout_rmse = float(np.sqrt(mean_squared_error(y_holdout, holdout_pred)))
     holdout_bias = float((y_holdout - holdout_pred).mean())
 
+    backtest_report = train_model.build_weekly_backtest_report(
+        holdout_df,
+        y_holdout.to_numpy(),
+        holdout_pred,
+        gameweek_policy=gameweek_policy,
+        model_rules=train_model.load_model_rules(os.environ.get("DOMAIN_RULES_PATH", "config/domain_rules.yaml")),
+    )
+    backtest_report = train_model.add_baseline_comparison_to_report(
+        backtest_report,
+        holdout_df.assign(predicted_points=holdout_pred),
+        y_holdout.to_numpy(),
+        gameweek_policy=gameweek_policy,
+        model_rules=train_model.load_model_rules(os.environ.get("DOMAIN_RULES_PATH", "config/domain_rules.yaml")),
+    )
+    publication_status = train_model.evaluate_publication_readiness(
+        backtest_report,
+        calibration_report=calibration_report,
+        model_rules=train_model.load_model_rules(os.environ.get("DOMAIN_RULES_PATH", "config/domain_rules.yaml")),
+    )
+    train_model.write_weekly_backtest_report(backtest_report, "logs/model_weekly_report.json")
+
     # Build feature importance
-    feature_importance = pd.DataFrame(
-        {"feature": features, "importance": model.feature_importances_}
-    ).sort_values("importance", ascending=False)
+    feature_importance = train_model.extract_feature_importance(model, features)
 
     # Position caps
     position_caps = {}
@@ -449,6 +528,12 @@ def save_best(state: TuningState) -> dict:
         "zscore_stats": global_stats,
         "feature_cols": features,
         "position_caps": position_caps,
+        "position_calibration": position_calibration,
+        "calibration_comparison": calibration_result["calibration_comparison"],
+        "calibration_report": calibration_report,
+        "evaluation_window_summary": backtest_report["summary"],
+        "baseline_comparison": backtest_report.get("baseline_comparison", {}),
+        "trusted_gameweek_policy_version": gameweek_policy.get("policy_version"),
         "train_target_stats": {
             "mean": float(y_train.mean()),
             "std": float(y_train.std()),
@@ -466,7 +551,18 @@ def save_best(state: TuningState) -> dict:
             "reg_lambda": best_params.get("reg_lambda", 1.0),
             "max_depth": best_params.get("max_depth", 5),
             "holdout_gameweeks": train_model.HOLDOUT_GAMEWEEKS,
+            "experiment_variant": state.get("experiment_variant", train_model.DEFAULT_EXPERIMENT_VARIANT),
             "calibration": calibration,
+            "position_calibration": position_calibration,
+            "selected_calibration_variant": selected_variant,
+            "baseline_comparison": backtest_report.get("baseline_comparison", {}),
+            "recent_validation_gameweeks": backtest_report.get("recent_validation_gameweeks", []),
+            "baseline_gate_passed": publication_status["gates"].get("baseline_gate_passed", True),
+            "baseline_metric_deltas": (backtest_report.get("required_baseline_comparison") or {}).get("metric_deltas", {}),
+            "forward_publish_ready": publication_status["ready"],
+            "forward_publish_gates": publication_status["gates"],
+            "forward_publish_reasons": publication_status["reasons"],
+            "gameweek_policy_version": gameweek_policy.get("policy_version"),
         },
     }
 

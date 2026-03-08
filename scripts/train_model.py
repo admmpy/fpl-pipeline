@@ -8,7 +8,10 @@ This script:
 4. Evaluates model performance
 5. Saves the trained model to disk
 """
+import argparse
 import logging
+import json
+import yaml
 import pandas as pd
 import numpy as np
 import xgboost as xgb
@@ -36,6 +39,11 @@ from utils.local_data import (
     emit_selection_log,
     load_training_dataframe,
 )
+from utils.gameweek_quality import (
+    classify_gameweek,
+    load_gameweek_quality_policy,
+    split_train_holdout_by_policy,
+)
 
 HOLDOUT_GAMEWEEKS = 5
 SHRINKAGE_ALPHA = 0.0
@@ -44,8 +52,69 @@ REG_LAMBDA = 1.0
 MAX_DEPTH = 5
 ENABLE_CALIBRATION = True
 CALIBRATION_STRENGTH = 0.8
+POSITION_CALIBRATION_MIN_SAMPLES = 25
 FEATURES_TO_SCALE = ['total_points', 'minutes_played', 'ict_index']
 LOG_TARGET = os.getenv("LOG_TARGET", "1").lower() in {"1", "true", "yes"}
+CALIBRATION_METRIC_TOLERANCE = float(os.getenv("CALIBRATION_METRIC_TOLERANCE", "0.0"))
+DISABLED_FEATURES = {"form"}
+RECENT_VALIDATION_GW_COUNT = 5
+BASELINE_FEATURE_COLUMNS = (
+    "five_week_players_roll_avg_points",
+    "three_week_players_roll_avg_points",
+    "total_points_z_score",
+)
+DEFAULT_EXPERIMENT_VARIANT = "shared_default"
+EXPERIMENT_SEQUENCE = (
+    "shared_no_minute_bands",
+    "shared_minutes_continuous_only",
+    "shared_upside_features",
+    "per_position_models",
+    "two_stage_minutes_points",
+)
+UPSIDE_PER90_COLUMNS = (
+    "goals_scored",
+    "assists",
+    "expected_goals",
+    "expected_assists",
+    "expected_goal_involvements",
+    "threat",
+    "creativity",
+    "ict_index",
+)
+SUM_AGG_COLUMNS = {
+    "total_points",
+    "minutes_played",
+    "goals_scored",
+    "expected_goals",
+    "expected_goal_involvements",
+    "assists",
+    "expected_assists",
+    "clean_sheets",
+    "goals_conceded",
+    "expected_goals_conceded",
+    "yellow_cards",
+    "red_cards",
+    "saves",
+    "bonus",
+    "influence",
+    "creativity",
+    "threat",
+    "ict_index",
+}
+MEAN_AGG_COLUMNS = {
+    "opponent_defence_strength",
+    "team_attack_strength",
+    "team_roll_avg_goals_scored",
+    "team_roll_avg_xg",
+    "team_roll_avg_clean_sheets",
+    "team_roll_avg_wins_pct",
+    "opponent_roll_avg_goals_conceded",
+    "opponent_roll_avg_xg",
+    "opponent_team_position",
+    "team_position_difference",
+    "three_week_players_roll_avg_points",
+    "five_week_players_roll_avg_points",
+}
 
 
 def _transform_target(y: pd.Series) -> pd.Series:
@@ -123,6 +192,46 @@ def fetch_training_data(
     return df
 
 
+def load_model_rules(path: str = "config/domain_rules.yaml") -> dict[str, Any]:
+    """Load model gate rules for reporting thresholds."""
+
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            raw = yaml.safe_load(handle) or {}
+    except FileNotFoundError:
+        return {}
+    return dict(raw.get("model") or {})
+
+
+def resolve_experiment_variant(variant: Optional[str] = None) -> str:
+    candidate = str(variant or os.getenv("EXPERIMENT_VARIANT", DEFAULT_EXPERIMENT_VARIANT)).strip() or DEFAULT_EXPERIMENT_VARIANT
+    supported = {DEFAULT_EXPERIMENT_VARIANT, *EXPERIMENT_SEQUENCE}
+    if candidate not in supported:
+        raise ValueError(f"Unsupported experiment variant: {candidate}")
+    return candidate
+
+
+def recent_validation_gameweeks(
+    df: pd.DataFrame,
+    *,
+    gameweek_col: str = "target_gameweek_id",
+    limit: int = RECENT_VALIDATION_GW_COUNT,
+) -> list[int]:
+    if gameweek_col not in df.columns:
+        return []
+    values = sorted(int(v) for v in df[gameweek_col].dropna().unique())
+    if not values:
+        return []
+    return values[-min(limit, len(values)) :]
+
+
+def get_baseline_gate_config(model_rules: Optional[dict[str, Any]] = None) -> tuple[str, list[str]]:
+    rules = model_rules or {}
+    baseline_name = str(rules.get("required_baseline", "five_week_players_roll_avg_points"))
+    metric_names = list(rules.get("baseline_gate_metrics") or ["top_k_hit_rate_mean", "selected_xi_regret_mean"])
+    return baseline_name, metric_names
+
+
 def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     Engineer additional features and handle missing values.
@@ -137,12 +246,19 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     
     df = df.copy()
     
+    # Canonicalise to one row per player/gameweek before shifting the target.
+    df = collapse_player_gameweek_rows(df)
+
     # 1. Create target variables (next gameweek points and gameweek id)
     # Sort by player and gameweek, then shift total_points forward
     df = df.sort_values(['player_id', 'gameweek_id'])
     df['target_next_gw_points'] = df.groupby('player_id')['total_points'].shift(-1)
+    df['target_next_gw_minutes'] = df.groupby('player_id')['minutes_played'].shift(-1)
     df['target_gameweek_id'] = df.groupby('player_id')['gameweek_id'].shift(-1)
     
+    # Drop terminal rows before any generic fill touches target columns.
+    df = df.dropna(subset=['target_next_gw_points', 'target_gameweek_id']).copy()
+
     # 2. Position encoding (one-hot)
     df['is_gk'] = (df['position_id'] == 1).astype(int)
     df['is_def'] = (df['position_id'] == 2).astype(int)
@@ -159,16 +275,93 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
         band_dummies = pd.get_dummies(df['minutes_band'], prefix='minutes_band')
         df = pd.concat([df, band_dummies], axis=1)
 
-    # 4. Fill missing values with sensible defaults
-    numeric_cols = df.select_dtypes(include=[np.number]).columns
+    df = engineer_upside_features(df)
+
+    # 4. Fill missing values with sensible defaults for non-target numeric features only.
+    target_cols = {'target_next_gw_points', 'target_next_gw_minutes', 'target_gameweek_id'}
+    numeric_cols = [
+        col for col in df.select_dtypes(include=[np.number]).columns
+        if col not in target_cols
+    ]
     df[numeric_cols] = df[numeric_cols].fillna(0)
-    
-    # 5. Drop rows without target (last GW for each player)
-    df = df.dropna(subset=['target_next_gw_points'])
+
+    validate_engineered_features(df)
     
     logger.info(f"Feature engineering complete. {len(df)} samples remain after creating target.")
     
     return df
+
+
+def engineer_upside_features(df: pd.DataFrame) -> pd.DataFrame:
+    engineered = df.copy()
+    if "minutes_played" in engineered.columns:
+        minutes_scale = engineered["minutes_played"].fillna(0).clip(lower=1.0) / 90.0
+        for column in UPSIDE_PER90_COLUMNS:
+            if column in engineered.columns:
+                engineered[f"{column}_per90"] = engineered[column].fillna(0) / minutes_scale
+
+    delta_pairs = (
+        ("three_week_players_roll_avg_points", "five_week_players_roll_avg_points", "player_points_roll_delta_3v5"),
+        ("team_roll_avg_goals_scored", "opponent_roll_avg_goals_conceded", "team_attack_vs_opp_goals_delta"),
+        ("team_roll_avg_xg", "opponent_roll_avg_xg", "team_attack_vs_opp_xg_delta"),
+        ("team_attack_strength", "opponent_defence_strength", "team_attack_strength_delta"),
+    )
+    for left, right, output in delta_pairs:
+        if left in engineered.columns and right in engineered.columns:
+            engineered[output] = engineered[left].fillna(0) - engineered[right].fillna(0)
+
+    return engineered
+
+
+def validate_engineered_features(df: pd.DataFrame) -> None:
+    """Fail fast when target engineering has produced invalid training rows."""
+
+    required = {'gameweek_id', 'target_gameweek_id', 'target_next_gw_points'}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing engineered target columns: {sorted(missing)}")
+
+    if df['target_next_gw_points'].isna().any():
+        raise ValueError("target_next_gw_points contains NaNs after engineering")
+    if df['target_gameweek_id'].isna().any():
+        raise ValueError("target_gameweek_id contains NaNs after engineering")
+    if (df['target_gameweek_id'] <= 0).any():
+        raise ValueError("target_gameweek_id must be > 0 after engineering")
+    if (df['target_gameweek_id'] <= df['gameweek_id']).any():
+        raise ValueError("target_gameweek_id must be strictly greater than gameweek_id")
+
+
+def collapse_player_gameweek_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """Collapse double-gameweek fixture rows into a single player-gameweek row."""
+
+    if "player_id" not in df.columns or "gameweek_id" not in df.columns:
+        return df.copy()
+
+    duplicate_mask = df.duplicated(subset=["player_id", "gameweek_id"], keep=False)
+    if not duplicate_mask.any():
+        return df.copy()
+
+    logger.warning(
+        "Collapsing %s duplicate player/gameweek rows before target engineering",
+        int(duplicate_mask.sum()),
+    )
+    frame = df.sort_values(["player_id", "gameweek_id", "fixture_id"] if "fixture_id" in df.columns else ["player_id", "gameweek_id"]).copy()
+    aggregations: dict[str, str] = {}
+    for column in frame.columns:
+        if column in {"player_id", "gameweek_id"}:
+            continue
+        if column in SUM_AGG_COLUMNS:
+            aggregations[column] = "sum"
+        elif column in MEAN_AGG_COLUMNS:
+            aggregations[column] = "mean"
+        else:
+            aggregations[column] = "last"
+
+    collapsed = (
+        frame.groupby(["player_id", "gameweek_id"], as_index=False)
+        .agg(aggregations)
+    )
+    return collapsed
 
 
 def compute_global_stats(df: pd.DataFrame) -> Dict[str, Dict[str, float]]:
@@ -213,26 +406,32 @@ def add_z_scores(
     return df
 
 
-def split_train_holdout(df: pd.DataFrame, holdout_gameweeks: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Split data into training and holdout sets based on target gameweek.
-    
-    Args:
-        df: Feature DataFrame with target_gameweek_id
-        holdout_gameweeks: Number of gameweeks to hold out
-        
-    Returns:
-        Tuple of (train_df, holdout_df)
-    """
+def split_train_holdout(
+    df: pd.DataFrame,
+    holdout_gameweeks: int,
+    *,
+    gameweek_policy: Optional[dict[str, Any]] = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Split data into training and holdout sets based on target gameweek."""
+
+    if gameweek_policy:
+        train_df, holdout_df, _ = split_train_holdout_by_policy(
+            df,
+            holdout_gameweeks=holdout_gameweeks,
+            policy=gameweek_policy,
+            target_gameweek_col="target_gameweek_id",
+        )
+        return train_df, holdout_df
+
     target_gameweeks = sorted(df['target_gameweek_id'].dropna().unique())
-    
+
     if len(target_gameweeks) <= holdout_gameweeks:
         raise ValueError("Not enough gameweeks to create a holdout set.")
-    
+
     holdout_gws = set(target_gameweeks[-holdout_gameweeks:])
     train_df = df[~df['target_gameweek_id'].isin(holdout_gws)].copy()
     holdout_df = df[df['target_gameweek_id'].isin(holdout_gws)].copy()
-    
+
     return train_df, holdout_df
 
 
@@ -282,6 +481,686 @@ def apply_calibration(predictions: np.ndarray, a: float, b: float) -> np.ndarray
     return a * predictions + b
 
 
+def fit_position_aware_calibration(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    position_ids: np.ndarray,
+    *,
+    strength: float,
+    min_samples: int = POSITION_CALIBRATION_MIN_SAMPLES,
+) -> dict[str, Any]:
+    """Fit global and per-position calibration using training-only data."""
+
+    global_a, global_b = fit_calibration(y_true, y_pred)
+    global_a, global_b = blend_calibration(global_a, global_b, strength)
+
+    payload: dict[str, Any] = {
+        "type": "position_aware_linear_v1",
+        "global": {
+            "a": float(global_a),
+            "b": float(global_b),
+            "strength": float(strength),
+        },
+        "min_samples": int(min_samples),
+        "by_position": {},
+    }
+
+    frame = pd.DataFrame(
+        {
+            "position_id": np.asarray(position_ids).astype(int),
+            "actual": np.asarray(y_true, dtype=float),
+            "predicted": np.asarray(y_pred, dtype=float),
+        }
+    )
+    for position_id, group in frame.groupby("position_id"):
+        count = int(len(group))
+        if count < int(min_samples):
+            payload["by_position"][str(int(position_id))] = {
+                "a": float(global_a),
+                "b": float(global_b),
+                "count": count,
+                "fallback": "global",
+            }
+            continue
+
+        pos_a, pos_b = fit_calibration(group["actual"].to_numpy(), group["predicted"].to_numpy())
+        pos_a, pos_b = blend_calibration(pos_a, pos_b, strength)
+        payload["by_position"][str(int(position_id))] = {
+            "a": float(pos_a),
+            "b": float(pos_b),
+            "count": count,
+            "fallback": None,
+        }
+    return payload
+
+
+def apply_position_aware_calibration(
+    predictions: np.ndarray,
+    position_ids: np.ndarray,
+    calibration_payload: Optional[dict[str, Any]],
+) -> np.ndarray:
+    """Apply per-position calibration with global fallback."""
+
+    pred = np.asarray(predictions, dtype=float).copy()
+    if not calibration_payload:
+        return pred
+
+    global_cfg = calibration_payload.get("global") or {}
+    global_a = float(global_cfg.get("a", 1.0))
+    global_b = float(global_cfg.get("b", 0.0))
+    by_position = calibration_payload.get("by_position") or {}
+
+    positions = np.asarray(position_ids).astype(int)
+    for idx, position_id in enumerate(positions):
+        cfg = by_position.get(str(int(position_id))) or {}
+        a = float(cfg.get("a", global_a))
+        b = float(cfg.get("b", global_b))
+        pred[idx] = a * pred[idx] + b
+    return pred
+
+
+def _safe_spearman(x: np.ndarray, y: np.ndarray) -> Optional[float]:
+    if len(x) < 2 or len(y) < 2:
+        return None
+    x_rank = pd.Series(x).rank(method="average")
+    y_rank = pd.Series(y).rank(method="average")
+    corr = x_rank.corr(y_rank, method="pearson")
+    if pd.isna(corr):
+        return None
+    return float(corr)
+
+
+def compute_focus_position_abs_bias(
+    positions: np.ndarray,
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    *,
+    focus_positions: tuple[int, ...] = (1, 2),
+) -> float:
+    """Compute mean absolute bias for focus positions (default GK/DEF)."""
+
+    frame = pd.DataFrame(
+        {
+            "position_id": np.asarray(positions).astype(int),
+            "actual": np.asarray(y_true, dtype=float),
+            "predicted": np.asarray(y_pred, dtype=float),
+        }
+    )
+    focus = frame[frame["position_id"].isin(set(focus_positions))]
+    if focus.empty:
+        return 0.0
+    grouped = (
+        focus.assign(error_bias=focus["actual"] - focus["predicted"])
+        .groupby("position_id")["error_bias"]
+        .mean()
+    )
+    return float(np.mean(np.abs(grouped.to_numpy(dtype=float))))
+
+
+def compute_prediction_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
+    """Compute core error metrics for a prediction vector."""
+
+    true = np.asarray(y_true, dtype=float)
+    pred = np.asarray(y_pred, dtype=float)
+    return {
+        "mae": float(mean_absolute_error(true, pred)),
+        "rmse": float(np.sqrt(mean_squared_error(true, pred))),
+        "bias": float((true - pred).mean()),
+    }
+
+
+def _calibration_candidate_score(
+    metrics: dict[str, float],
+    *,
+    focus_bias: Optional[float],
+) -> tuple[float, float, float, float]:
+    return (
+        float(metrics["mae"]),
+        float(metrics["rmse"]),
+        abs(float(metrics["bias"])),
+        float(focus_bias if focus_bias is not None else 0.0),
+    )
+
+
+def select_calibration_variant(
+    *,
+    y_train: np.ndarray,
+    train_pred: np.ndarray,
+    y_holdout: np.ndarray,
+    holdout_pred: np.ndarray,
+    train_position_ids: Optional[np.ndarray] = None,
+    holdout_position_ids: Optional[np.ndarray] = None,
+    strength: float,
+    min_samples: int = POSITION_CALIBRATION_MIN_SAMPLES,
+    tolerance: float = CALIBRATION_METRIC_TOLERANCE,
+) -> dict[str, Any]:
+    """Fit optional calibration variants and select a safe winner against `none`."""
+
+    pre_pred = np.asarray(holdout_pred, dtype=float)
+    baseline_metrics = compute_prediction_metrics(y_holdout, pre_pred)
+    global_pred = None
+    position_pred = None
+    calibration = None
+    position_calibration = None
+    calibration_comparison = {
+        "selected": "none",
+        "gk_def_abs_bias_global": None,
+        "gk_def_abs_bias_position": None,
+        "position_calibration_gain": None,
+    }
+    selected_variant = "none"
+    selected_pred = pre_pred
+
+    candidates: list[tuple[tuple[float, float, float, float], str, np.ndarray]] = [
+        (_calibration_candidate_score(baseline_metrics, focus_bias=None), "none", pre_pred)
+    ]
+
+    if strength > 0:
+        a, b = fit_calibration(np.asarray(y_train, dtype=float), np.asarray(train_pred, dtype=float))
+        a, b = blend_calibration(a, b, strength)
+        calibration = {"a": float(a), "b": float(b), "strength": float(strength)}
+        global_pred = apply_calibration(pre_pred, a, b)
+        global_metrics = compute_prediction_metrics(y_holdout, global_pred)
+        global_ok = (
+            global_metrics["mae"] <= baseline_metrics["mae"] + tolerance
+            and global_metrics["rmse"] <= baseline_metrics["rmse"] + tolerance
+        )
+        if global_ok:
+            focus_bias = None
+            if holdout_position_ids is not None:
+                focus_bias = compute_focus_position_abs_bias(holdout_position_ids, y_holdout, global_pred)
+            candidates.append((_calibration_candidate_score(global_metrics, focus_bias=focus_bias), "global", global_pred))
+
+        if train_position_ids is not None and holdout_position_ids is not None:
+            position_calibration = fit_position_aware_calibration(
+                np.asarray(y_train, dtype=float),
+                np.asarray(train_pred, dtype=float),
+                np.asarray(train_position_ids, dtype=int),
+                strength=strength,
+                min_samples=min_samples,
+            )
+            position_pred = apply_position_aware_calibration(
+                pre_pred,
+                np.asarray(holdout_position_ids, dtype=int),
+                position_calibration,
+            )
+            if global_pred is not None:
+                global_abs = compute_focus_position_abs_bias(holdout_position_ids, y_holdout, global_pred)
+                position_abs = compute_focus_position_abs_bias(holdout_position_ids, y_holdout, position_pred)
+                calibration_comparison.update(
+                    {
+                        "gk_def_abs_bias_global": float(global_abs),
+                        "gk_def_abs_bias_position": float(position_abs),
+                        "position_calibration_gain": float(global_abs - position_abs),
+                    }
+                )
+            position_metrics = compute_prediction_metrics(y_holdout, position_pred)
+            position_ok = (
+                position_metrics["mae"] <= baseline_metrics["mae"] + tolerance
+                and position_metrics["rmse"] <= baseline_metrics["rmse"] + tolerance
+            )
+            if position_ok:
+                focus_bias = None
+                if holdout_position_ids is not None:
+                    focus_bias = compute_focus_position_abs_bias(holdout_position_ids, y_holdout, position_pred)
+                candidates.append(
+                    (_calibration_candidate_score(position_metrics, focus_bias=focus_bias), "position_aware", position_pred)
+                )
+
+    selected_score, selected_variant, selected_pred = min(candidates, key=lambda item: item[0])
+    _ = selected_score
+    calibration_comparison["selected"] = selected_variant
+    calibration_report = build_calibration_report(
+        np.asarray(y_holdout, dtype=float),
+        pre_pred,
+        global_calibration_pred=np.asarray(global_pred) if global_pred is not None else None,
+        position_calibration_pred=np.asarray(position_pred) if position_pred is not None else None,
+        selected_variant=selected_variant,
+        position_ids=np.asarray(holdout_position_ids, dtype=int) if holdout_position_ids is not None else None,
+    )
+    if calibration_report.get("gk_def_abs_bias_global") is not None:
+        calibration_comparison["gk_def_abs_bias_global"] = calibration_report.get("gk_def_abs_bias_global")
+    if calibration_report.get("gk_def_abs_bias_position") is not None:
+        calibration_comparison["gk_def_abs_bias_position"] = calibration_report.get("gk_def_abs_bias_position")
+        calibration_comparison["position_calibration_gain"] = float(
+            calibration_report["gk_def_abs_bias_global"] - calibration_report["gk_def_abs_bias_position"]
+        )
+
+    if selected_variant == "none":
+        calibration = None
+        position_calibration = None
+    elif selected_variant == "global":
+        position_calibration = None
+    elif selected_variant == "position_aware":
+        calibration = None
+
+    return {
+        "selected_variant": selected_variant,
+        "selected_pred": np.asarray(selected_pred, dtype=float),
+        "calibration": calibration,
+        "position_calibration": position_calibration,
+        "calibration_comparison": calibration_comparison,
+        "calibration_report": calibration_report,
+    }
+
+
+def apply_prediction_post_processing(
+    predictions: np.ndarray,
+    *,
+    league_mean: Optional[float] = None,
+    shrinkage_alpha: float = 0.0,
+    calibration: Optional[dict[str, Any]] = None,
+    position_calibration: Optional[dict[str, Any]] = None,
+    selected_variant: str = "none",
+    position_ids: Optional[np.ndarray] = None,
+    position_caps: Optional[dict[Any, float]] = None,
+) -> np.ndarray:
+    """Apply the shared live/PIT prediction post-processing contract."""
+
+    pred = np.asarray(predictions, dtype=float).copy()
+    if league_mean is not None:
+        pred = apply_shrinkage(pred, float(league_mean), float(shrinkage_alpha))
+
+    if selected_variant == "position_aware" and position_calibration is not None and position_ids is not None:
+        pred = apply_position_aware_calibration(pred, np.asarray(position_ids, dtype=int), position_calibration)
+    elif selected_variant == "global" and calibration is not None:
+        pred = apply_calibration(pred, float(calibration.get("a", 1.0)), float(calibration.get("b", 0.0)))
+
+    pred = np.maximum(pred, 0)
+
+    if position_caps and position_ids is not None:
+        cap_series = pd.Series(np.asarray(position_ids, dtype=int)).map(position_caps).fillna(np.inf)
+        pred = np.minimum(pred, cap_series.to_numpy(dtype=float))
+
+    return pred
+
+
+def build_calibration_report(
+    y_true: np.ndarray,
+    pre_calibration_pred: np.ndarray,
+    *,
+    global_calibration_pred: Optional[np.ndarray] = None,
+    position_calibration_pred: Optional[np.ndarray] = None,
+    selected_variant: str = "none",
+    position_ids: Optional[np.ndarray] = None,
+) -> dict[str, Any]:
+    """Build pre/post calibration metrics and deltas for auditing."""
+
+    pre = compute_prediction_metrics(y_true, pre_calibration_pred)
+    report: dict[str, Any] = {
+        "selected_variant": selected_variant,
+        "pre_calibration": pre,
+        "post_global": None,
+        "post_position_aware": None,
+        "selected_post": pre,
+        "selected_delta": {"mae": 0.0, "rmse": 0.0, "bias": 0.0},
+    }
+
+    if global_calibration_pred is not None:
+        global_metrics = compute_prediction_metrics(y_true, global_calibration_pred)
+        report["post_global"] = global_metrics
+        report["delta_global_vs_pre"] = {
+            key: float(global_metrics[key] - pre[key]) for key in ("mae", "rmse", "bias")
+        }
+
+    if position_calibration_pred is not None:
+        position_metrics = compute_prediction_metrics(y_true, position_calibration_pred)
+        report["post_position_aware"] = position_metrics
+        report["delta_position_vs_pre"] = {
+            key: float(position_metrics[key] - pre[key]) for key in ("mae", "rmse", "bias")
+        }
+
+    selected_map: dict[str, Optional[np.ndarray]] = {
+        "none": pre_calibration_pred,
+        "global": global_calibration_pred,
+        "position_aware": position_calibration_pred,
+    }
+    selected_pred = selected_map.get(selected_variant)
+    if selected_pred is None:
+        selected_pred = pre_calibration_pred
+    selected_metrics = compute_prediction_metrics(y_true, selected_pred)
+    report["selected_post"] = selected_metrics
+    report["selected_delta"] = {
+        key: float(selected_metrics[key] - pre[key]) for key in ("mae", "rmse", "bias")
+    }
+
+    if position_ids is not None:
+        positions = np.asarray(position_ids).astype(int)
+        pre_focus = compute_focus_position_abs_bias(positions, y_true, pre_calibration_pred)
+        report["gk_def_abs_bias_pre"] = float(pre_focus)
+        if global_calibration_pred is not None:
+            report["gk_def_abs_bias_global"] = float(
+                compute_focus_position_abs_bias(positions, y_true, global_calibration_pred)
+            )
+        if position_calibration_pred is not None:
+            report["gk_def_abs_bias_position"] = float(
+                compute_focus_position_abs_bias(positions, y_true, position_calibration_pred)
+            )
+
+    return report
+
+
+def build_weekly_backtest_report(
+    holdout_df: pd.DataFrame,
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    *,
+    gameweek_policy: Optional[dict[str, Any]] = None,
+    model_rules: Optional[dict[str, Any]] = None,
+    top_k: int = 11,
+) -> dict[str, Any]:
+    """Build rolling per-gameweek backtest report for trusted weeks."""
+
+    if "target_gameweek_id" not in holdout_df.columns:
+        raise ValueError("holdout_df must include target_gameweek_id for weekly backtest report")
+
+    frame = holdout_df.copy().reset_index(drop=True)
+    frame["actual_points"] = np.asarray(y_true, dtype=float)
+    frame["predicted_points"] = np.asarray(y_pred, dtype=float)
+    frame["abs_error"] = np.abs(frame["actual_points"] - frame["predicted_points"])
+    frame["error_bias"] = frame["actual_points"] - frame["predicted_points"]
+
+    min_ratio = float((model_rules or {}).get("min_prediction_to_actual_ratio", 0.6))
+    max_ratio = float((model_rules or {}).get("max_prediction_to_actual_ratio", 1.6))
+    instability_bias_threshold = float((model_rules or {}).get("instability_bias_abs_threshold", 10.0))
+
+    per_week: list[dict[str, Any]] = []
+    for gameweek_id, group in frame.groupby("target_gameweek_id"):
+        actual_total = float(group["actual_points"].sum())
+        predicted_total = float(group["predicted_points"].sum())
+        ratio = float(predicted_total / max(actual_total, 1e-9))
+        mae = float(group["abs_error"].mean())
+        rmse = float(np.sqrt(np.mean(np.square(group["error_bias"]))))
+        bias = float(group["error_bias"].mean())
+
+        likely = group[group["minutes_played"] >= 60].copy() if "minutes_played" in group.columns else group.copy()
+        k = min(int(top_k), int(len(likely)))
+
+        top_k_hit_rate = None
+        rank_corr = None
+        if k > 0:
+            pred_top = likely.nlargest(k, "predicted_points")
+            actual_top = likely.nlargest(k, "actual_points")
+            pred_ids = set(pred_top["player_id"].tolist()) if "player_id" in likely.columns else set(pred_top.index.tolist())
+            actual_ids = set(actual_top["player_id"].tolist()) if "player_id" in likely.columns else set(actual_top.index.tolist())
+            top_k_hit_rate = float(len(pred_ids & actual_ids) / k)
+            rank_corr = _safe_spearman(
+                likely["predicted_points"].to_numpy(),
+                likely["actual_points"].to_numpy(),
+            )
+
+        selected_xi = group.nlargest(min(11, len(group)), "predicted_points")
+        optimal_xi = group.nlargest(min(11, len(group)), "actual_points")
+        selected_xi_actual = float(selected_xi["actual_points"].sum())
+        optimal_xi_actual = float(optimal_xi["actual_points"].sum())
+        selected_xi_regret = float(optimal_xi_actual - selected_xi_actual)
+
+        selected_squad = group.nlargest(min(15, len(group)), "predicted_points")
+        selected_squad_pred_total = float(selected_squad["predicted_points"].sum())
+        selected_squad_actual_total = float(selected_squad["actual_points"].sum())
+
+        if "position_id" in group.columns:
+            position_totals = (
+                group.groupby("position_id")[["predicted_points", "actual_points"]]
+                .sum()
+                .reset_index()
+                .to_dict(orient="records")
+            )
+            for row in position_totals:
+                row["position_id"] = int(row["position_id"])
+                row["predicted_points"] = float(row["predicted_points"])
+                row["actual_points"] = float(row["actual_points"])
+                row["bias"] = float(row["actual_points"] - row["predicted_points"])
+        else:
+            position_totals = []
+
+        largest_misses_cols = ["player_id", "actual_points", "predicted_points", "abs_error"]
+        if "web_name" in group.columns:
+            largest_misses_cols.insert(1, "web_name")
+        largest_misses = group.nlargest(min(5, len(group)), "abs_error")[largest_misses_cols].to_dict(orient="records")
+        for row in largest_misses:
+            row["player_id"] = int(row.get("player_id", 0))
+            row["actual_points"] = float(row["actual_points"])
+            row["predicted_points"] = float(row["predicted_points"])
+            row["abs_error"] = float(row["abs_error"])
+
+        actual_range = float(group["actual_points"].max() - group["actual_points"].min())
+        predicted_range = float(group["predicted_points"].max() - group["predicted_points"].min())
+        range_ratio = float(predicted_range / max(actual_range, 1e-9))
+
+        collapse = ratio < min_ratio or ratio > max_ratio
+        quality = classify_gameweek(int(gameweek_id), gameweek_policy or {}) if gameweek_policy else {"trusted": True, "status": "trusted"}
+
+        per_week.append(
+            {
+                "gameweek_id": int(gameweek_id),
+                "trusted": bool(quality["trusted"]),
+                "status": quality["status"],
+                "prediction_total": predicted_total,
+                "actual_total": actual_total,
+                "prediction_to_actual_ratio": ratio,
+                "mae": mae,
+                "rmse": rmse,
+                "bias": bias,
+                "prediction_range_ratio": range_ratio,
+                "selected_squad_predicted_total": selected_squad_pred_total,
+                "selected_squad_actual_total": selected_squad_actual_total,
+                "selected_squad_bias": float(selected_squad_actual_total - selected_squad_pred_total),
+                "selected_xi_actual_total": selected_xi_actual,
+                "oracle_xi_actual_total": optimal_xi_actual,
+                "top_k_hit_rate": top_k_hit_rate,
+                "rank_correlation": rank_corr,
+                "selected_xi_regret": selected_xi_regret,
+                "prediction_collapse": bool(collapse),
+                "largest_player_misses": largest_misses,
+                "position_totals": position_totals,
+            }
+        )
+
+    if "position_id" in frame.columns:
+        position_summary = (
+            frame.groupby("position_id")
+            .agg(
+                count=("position_id", "count"),
+                mae=("abs_error", "mean"),
+                bias=("error_bias", "mean"),
+            )
+            .reset_index()
+            .to_dict(orient="records")
+        )
+        for row in position_summary:
+            row["position_id"] = int(row["position_id"])
+            row["count"] = int(row["count"])
+            row["mae"] = float(row["mae"])
+            row["bias"] = float(row["bias"])
+    else:
+        position_summary = []
+
+    top_k_values = [row["top_k_hit_rate"] for row in per_week if row["top_k_hit_rate"] is not None]
+    rank_values = [row["rank_correlation"] for row in per_week if row["rank_correlation"] is not None]
+    regret_values = [row["selected_xi_regret"] for row in per_week]
+    squad_bias_values = [abs(row["selected_squad_bias"]) for row in per_week]
+    selected_xi_totals = [row["selected_xi_actual_total"] for row in per_week]
+    oracle_xi_totals = [row["oracle_xi_actual_total"] for row in per_week]
+    prediction_ratios = [row["prediction_to_actual_ratio"] for row in per_week]
+    collapse_weeks = [row["gameweek_id"] for row in per_week if row["prediction_collapse"]]
+    max_position_bias = max((abs(row["bias"]) for row in position_summary), default=0.0)
+
+    per_week_sorted = sorted(per_week, key=lambda row: row["gameweek_id"])
+
+    bias_flip_pairs: list[list[int]] = []
+    for idx in range(1, len(per_week_sorted)):
+        prev = per_week_sorted[idx - 1]
+        curr = per_week_sorted[idx]
+        prev_bias = float(prev["bias"])
+        curr_bias = float(curr["bias"])
+        prev_sign = np.sign(prev_bias)
+        curr_sign = np.sign(curr_bias)
+        if prev_sign == 0 or curr_sign == 0 or prev_sign == curr_sign:
+            continue
+        if abs(prev_bias) < instability_bias_threshold or abs(curr_bias) < instability_bias_threshold:
+            continue
+        bias_flip_pairs.append([int(prev["gameweek_id"]), int(curr["gameweek_id"])])
+
+    summary = {
+        "weekly_count": int(len(per_week)),
+        "mae": float(frame["abs_error"].mean()),
+        "rmse": float(np.sqrt(np.mean(np.square(frame["error_bias"])) )),
+        "bias": float(frame["error_bias"].mean()),
+        "top_k_hit_rate_mean": float(np.mean(top_k_values)) if top_k_values else 0.0,
+        "rank_correlation_mean": float(np.mean(rank_values)) if rank_values else 0.0,
+        "selected_xi_regret_mean": float(np.mean(regret_values)) if regret_values else 0.0,
+        "selected_xi_actual_total_mean": float(np.mean(selected_xi_totals)) if selected_xi_totals else 0.0,
+        "oracle_xi_actual_total_mean": float(np.mean(oracle_xi_totals)) if oracle_xi_totals else 0.0,
+        "squad_total_bias_abs_mean": float(np.mean(squad_bias_values)) if squad_bias_values else 0.0,
+        "max_position_bias_abs": float(max_position_bias),
+        "prediction_to_actual_ratio_min": float(min(prediction_ratios)) if prediction_ratios else 1.0,
+        "prediction_to_actual_ratio_max": float(max(prediction_ratios)) if prediction_ratios else 1.0,
+        "prediction_collapse_weeks": int(len(collapse_weeks)),
+        "prediction_collapse_detected": bool(collapse_weeks),
+        "prediction_collapse_gameweeks": collapse_weeks,
+        "instability_bias_abs_threshold": float(instability_bias_threshold),
+        "bias_flip_weeks": int(len(bias_flip_pairs)),
+        "bias_flip_detected": bool(bias_flip_pairs),
+        "bias_flip_gameweek_pairs": bias_flip_pairs,
+    }
+
+    return {
+        "summary": summary,
+        "per_week": per_week_sorted,
+        "per_position": sorted(position_summary, key=lambda row: row["position_id"]),
+    }
+
+
+def add_baseline_comparison_to_report(
+    report: dict[str, Any],
+    holdout_df: pd.DataFrame,
+    y_true: np.ndarray,
+    *,
+    gameweek_policy: Optional[dict[str, Any]] = None,
+    model_rules: Optional[dict[str, Any]] = None,
+    baseline_columns: tuple[str, ...] = BASELINE_FEATURE_COLUMNS,
+) -> dict[str, Any]:
+    enriched = dict(report)
+    source_df = holdout_df.reset_index(drop=True).copy()
+    y_array = np.asarray(y_true, dtype=float)
+    if len(source_df) != len(y_array):
+        raise ValueError("holdout_df and y_true must have the same length for baseline comparison")
+
+    recent_gws = recent_validation_gameweeks(source_df)
+    if recent_gws:
+        recent_mask = source_df["target_gameweek_id"].isin(recent_gws).to_numpy()
+    else:
+        recent_mask = np.ones(len(source_df), dtype=bool)
+    recent_df = source_df.loc[recent_mask].copy()
+    y_recent = y_array[recent_mask]
+    model_recent_pred = recent_df["predicted_points"].to_numpy() if "predicted_points" in recent_df.columns else y_recent
+    model_recent_report = build_weekly_backtest_report(
+        recent_df,
+        y_recent,
+        model_recent_pred,
+        gameweek_policy=gameweek_policy,
+        model_rules=model_rules,
+    )
+
+    baseline_name, metric_names = get_baseline_gate_config(model_rules)
+    comparison: dict[str, Any] = {}
+    for column in baseline_columns:
+        if column not in recent_df.columns:
+            continue
+        baseline_pred = recent_df[column].fillna(0).to_numpy(dtype=float)
+        baseline_report = build_weekly_backtest_report(
+            recent_df,
+            y_recent,
+            baseline_pred,
+            gameweek_policy=gameweek_policy,
+            model_rules=model_rules,
+        )
+        baseline_summary = baseline_report.get("summary") or {}
+        model_summary = model_recent_report.get("summary") or {}
+        deltas = {
+            "top_k_hit_rate_mean": float(model_summary.get("top_k_hit_rate_mean", 0.0) - baseline_summary.get("top_k_hit_rate_mean", 0.0)),
+            "rank_correlation_mean": float(model_summary.get("rank_correlation_mean", 0.0) - baseline_summary.get("rank_correlation_mean", 0.0)),
+            "selected_xi_regret_mean": float(model_summary.get("selected_xi_regret_mean", 0.0) - baseline_summary.get("selected_xi_regret_mean", 0.0)),
+        }
+        gate_pass = True
+        if "top_k_hit_rate_mean" in metric_names:
+            gate_pass = gate_pass and float(model_summary.get("top_k_hit_rate_mean", 0.0)) > float(baseline_summary.get("top_k_hit_rate_mean", 0.0))
+        if "selected_xi_regret_mean" in metric_names:
+            gate_pass = gate_pass and float(model_summary.get("selected_xi_regret_mean", 0.0)) < float(baseline_summary.get("selected_xi_regret_mean", float("inf")))
+        comparison[column] = {
+            "baseline_name": column,
+            "recent_gameweeks": list(recent_gws),
+            "metric_names": list(metric_names),
+            "model_summary": model_summary,
+            "baseline_summary": baseline_summary,
+            "metric_deltas": deltas,
+            "baseline_gate_passed": bool(gate_pass),
+        }
+
+    enriched["recent_validation_gameweeks"] = list(recent_gws)
+    enriched["baseline_comparison"] = comparison
+    required = comparison.get(baseline_name)
+    enriched["required_baseline"] = baseline_name
+    enriched["required_baseline_comparison"] = required or {}
+    return enriched
+
+
+def evaluate_publication_readiness(
+    backtest_report: dict[str, Any],
+    *,
+    calibration_report: Optional[dict[str, Any]] = None,
+    model_rules: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """Determine whether forward publication should be allowed for the active artefact."""
+
+    summary = (backtest_report or {}).get("summary") or {}
+    calibration_delta = (calibration_report or {}).get("selected_delta") or {}
+    required_baseline = (backtest_report or {}).get("required_baseline_comparison") or {}
+    required_baseline_summary = required_baseline.get("baseline_summary") or {}
+    model_summary = required_baseline.get("model_summary") or summary
+    gates = {
+        "max_prediction_collapse_weeks": int(summary.get("prediction_collapse_weeks", 0))
+        <= int((model_rules or {}).get("max_prediction_collapse_weeks", 0)),
+        "max_bias_flip_weeks": int(summary.get("bias_flip_weeks", 0))
+        <= int((model_rules or {}).get("max_bias_flip_weeks", 0)),
+        "min_top_k_hit_rate": float(summary.get("top_k_hit_rate_mean", 0.0))
+        >= float((model_rules or {}).get("min_top_k_hit_rate", 0.0)),
+        "min_rank_correlation": float(summary.get("rank_correlation_mean", 0.0))
+        >= float((model_rules or {}).get("min_rank_correlation", 0.0)),
+        "max_selected_xi_regret": float(summary.get("selected_xi_regret_mean", 0.0))
+        <= float((model_rules or {}).get("max_selected_xi_regret", float("inf"))),
+        "prediction_ratio_min": float(summary.get("prediction_to_actual_ratio_min", 1.0))
+        >= float((model_rules or {}).get("min_prediction_to_actual_ratio", 0.0)),
+        "prediction_ratio_max": float(summary.get("prediction_to_actual_ratio_max", 1.0))
+        <= float((model_rules or {}).get("max_prediction_to_actual_ratio", float("inf"))),
+        "baseline_top_k_hit_rate": (
+            True
+            if not required_baseline
+            else float(model_summary.get("top_k_hit_rate_mean", 0.0))
+            > float(required_baseline_summary.get("top_k_hit_rate_mean", 0.0))
+        ),
+        "baseline_selected_xi_regret": (
+            True
+            if not required_baseline
+            else float(model_summary.get("selected_xi_regret_mean", 0.0))
+            < float(required_baseline_summary.get("selected_xi_regret_mean", float("inf")))
+        ),
+        "baseline_gate_passed": bool(required_baseline.get("baseline_gate_passed", True)),
+        "calibration_safe_mae": float(calibration_delta.get("mae", 0.0)) <= CALIBRATION_METRIC_TOLERANCE,
+        "calibration_safe_rmse": float(calibration_delta.get("rmse", 0.0)) <= CALIBRATION_METRIC_TOLERANCE,
+    }
+    ready = all(gates.values())
+    reasons = [name for name, passed in gates.items() if not passed]
+    return {"ready": ready, "gates": gates, "reasons": reasons}
+
+
+def write_weekly_backtest_report(report: dict[str, Any], path: str) -> str:
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(report, handle, indent=2, sort_keys=True)
+    return path
+
+
 def print_group_bias(df: pd.DataFrame, y_true: np.ndarray, y_pred: np.ndarray, group_col: str, label: str) -> None:
     """
     Print bias metrics grouped by a column.
@@ -311,14 +1190,8 @@ def print_group_bias(df: pd.DataFrame, y_true: np.ndarray, y_pred: np.ndarray, g
         )
 
 
-def select_features() -> list:
-    """
-    Define the feature set for training.
-    
-    Returns:
-        List of feature column names
-    """
-    features = [
+def _base_feature_list() -> list[str]:
+    return [
         # Current gameweek performance
         'total_points',
         'minutes_played',
@@ -363,7 +1236,6 @@ def select_features() -> list:
         'team_position_difference',
         
         # Player metadata
-        'form',
         'now_cost',
         
         # Z-scores
@@ -381,10 +1253,38 @@ def select_features() -> list:
         'minutes_band_0_30',
         'minutes_band_31_60',
         'minutes_band_61_90',
-        
     ]
+
+
+def _upside_feature_list() -> list[str]:
+    return [f"{column}_per90" for column in UPSIDE_PER90_COLUMNS] + [
+        "player_points_roll_delta_3v5",
+        "team_attack_vs_opp_goals_delta",
+        "team_attack_vs_opp_xg_delta",
+        "team_attack_strength_delta",
+    ]
+
+
+def select_features(variant: Optional[str] = None) -> list:
+    """
+    Define the feature set for training.
     
-    return features
+    Returns:
+        List of feature column names
+    """
+    resolved_variant = resolve_experiment_variant(variant)
+    features = _base_feature_list()
+
+    if resolved_variant in {"shared_no_minute_bands", "shared_minutes_continuous_only", "shared_upside_features", "per_position_models", "two_stage_minutes_points"}:
+        features = [feature for feature in features if not feature.startswith("minutes_band_")]
+    if resolved_variant in {"shared_upside_features", "per_position_models", "two_stage_minutes_points"}:
+        features.extend(_upside_feature_list())
+
+    deduped: list[str] = []
+    for feature in features:
+        if feature not in DISABLED_FEATURES and feature not in deduped:
+            deduped.append(feature)
+    return deduped
 
 
 def train_xgboost_model(X: pd.DataFrame, y: pd.Series) -> xgb.XGBRegressor:
@@ -439,6 +1339,175 @@ def train_xgboost_model(X: pd.DataFrame, y: pd.Series) -> xgb.XGBRegressor:
     return model
 
 
+def build_xgb_regressor(params: Optional[dict[str, Any]] = None) -> xgb.XGBRegressor:
+    config = {
+        "n_estimators": 200,
+        "max_depth": MAX_DEPTH,
+        "learning_rate": 0.1,
+        "subsample": 0.8,
+        "colsample_bytree": 0.8,
+        "random_state": 42,
+        "n_jobs": -1,
+        "objective": "reg:squarederror",
+        "reg_alpha": REG_ALPHA,
+        "reg_lambda": REG_LAMBDA,
+        "eval_metric": "mae",
+    }
+    if params:
+        config.update({key: value for key, value in params.items() if key in config or key in {"min_child_weight", "gamma", "max_delta_step"}})
+    return xgb.XGBRegressor(**config)
+
+
+def build_xgb_classifier(params: Optional[dict[str, Any]] = None) -> xgb.XGBClassifier:
+    config = {
+        "n_estimators": 200,
+        "max_depth": MAX_DEPTH,
+        "learning_rate": 0.1,
+        "subsample": 0.8,
+        "colsample_bytree": 0.8,
+        "random_state": 42,
+        "n_jobs": -1,
+        "objective": "binary:logistic",
+        "reg_alpha": REG_ALPHA,
+        "reg_lambda": REG_LAMBDA,
+        "eval_metric": "logloss",
+    }
+    if params:
+        config.update({key: value for key, value in params.items() if key in config or key in {"min_child_weight", "gamma", "max_delta_step"}})
+    return xgb.XGBClassifier(**config)
+
+
+def train_prediction_bundle(
+    train_df: pd.DataFrame,
+    feature_cols: list[str],
+    *,
+    variant: Optional[str] = None,
+    params: Optional[dict[str, Any]] = None,
+    use_log_target: bool = LOG_TARGET,
+) -> dict[str, Any]:
+    resolved_variant = resolve_experiment_variant(variant)
+    X_train = train_df[feature_cols].fillna(0)
+    y_train = train_df["target_next_gw_points"]
+
+    if resolved_variant in {DEFAULT_EXPERIMENT_VARIANT, "shared_no_minute_bands", "shared_minutes_continuous_only", "shared_upside_features"}:
+        model = build_xgb_regressor(params)
+        y_fit = _transform_target(y_train) if use_log_target else y_train
+        model.fit(X_train, y_fit)
+        return {"architecture": "shared", "variant": resolved_variant, "model": model}
+
+    if resolved_variant == "per_position_models":
+        models: dict[str, Any] = {}
+        for position_id in sorted(int(v) for v in train_df["position_id"].dropna().unique()):
+            subset = train_df[train_df["position_id"] == position_id]
+            if subset.empty:
+                continue
+            model = build_xgb_regressor(params)
+            y_fit = _transform_target(subset["target_next_gw_points"]) if use_log_target else subset["target_next_gw_points"]
+            model.fit(subset[feature_cols].fillna(0), y_fit)
+            models[str(position_id)] = model
+        fallback = build_xgb_regressor(params)
+        fallback_y = _transform_target(y_train) if use_log_target else y_train
+        fallback.fit(X_train, fallback_y)
+        return {
+            "architecture": "per_position",
+            "variant": resolved_variant,
+            "models_by_position": models,
+            "fallback_model": fallback,
+        }
+
+    if resolved_variant == "two_stage_minutes_points":
+        if "target_next_gw_minutes" not in train_df.columns:
+            raise ValueError("two_stage_minutes_points requires target_next_gw_minutes")
+        stage_a_target = (train_df["target_next_gw_minutes"] >= 60).astype(int)
+        classifier = build_xgb_classifier(params)
+        classifier.fit(X_train, stage_a_target)
+        conditional_df = train_df[train_df["target_next_gw_minutes"] >= 60].copy()
+        if conditional_df.empty:
+            raise ValueError("two_stage_minutes_points has no training rows with target_next_gw_minutes >= 60")
+        regressor = build_xgb_regressor(params)
+        conditional_target = conditional_df["target_next_gw_points"]
+        y_fit = _transform_target(conditional_target) if use_log_target else conditional_target
+        regressor.fit(conditional_df[feature_cols].fillna(0), y_fit)
+        return {
+            "architecture": "two_stage_minutes_points",
+            "variant": resolved_variant,
+            "minutes_threshold": 60,
+            "stage_a_classifier": classifier,
+            "stage_b_regressor": regressor,
+        }
+
+    raise ValueError(f"Unsupported prediction bundle variant: {resolved_variant}")
+
+
+def predict_prediction_bundle(
+    bundle: dict[str, Any] | xgb.XGBRegressor,
+    frame: pd.DataFrame,
+    feature_cols: list[str],
+    *,
+    use_log_target: bool = LOG_TARGET,
+) -> np.ndarray:
+    X_frame = frame[feature_cols].fillna(0)
+    if isinstance(bundle, xgb.XGBRegressor) or hasattr(bundle, "predict") and not isinstance(bundle, dict):
+        raw_pred = bundle.predict(X_frame)
+        return _inverse_transform(raw_pred) if use_log_target else np.asarray(raw_pred)
+
+    architecture = str(bundle.get("architecture", "shared"))
+    if architecture == "shared":
+        raw_pred = bundle["model"].predict(X_frame)
+        return _inverse_transform(raw_pred) if use_log_target else np.asarray(raw_pred)
+
+    if architecture == "per_position":
+        predictions = np.zeros(len(frame), dtype=float)
+        fallback_model = bundle["fallback_model"]
+        position_ids = frame["position_id"].to_numpy() if "position_id" in frame.columns else np.zeros(len(frame), dtype=int)
+        for idx, position_id in enumerate(position_ids):
+            model = bundle["models_by_position"].get(str(int(position_id)), fallback_model)
+            row_frame = X_frame.iloc[[idx]]
+            raw_pred = model.predict(row_frame)
+            value = _inverse_transform(raw_pred)[0] if use_log_target else float(raw_pred[0])
+            predictions[idx] = float(value)
+        return predictions
+
+    if architecture == "two_stage_minutes_points":
+        probabilities = bundle["stage_a_classifier"].predict_proba(X_frame)[:, 1]
+        raw_points = bundle["stage_b_regressor"].predict(X_frame)
+        conditional_points = _inverse_transform(raw_points) if use_log_target else np.asarray(raw_points)
+        return np.asarray(probabilities) * np.asarray(conditional_points)
+
+    raise ValueError(f"Unsupported prediction bundle architecture: {architecture}")
+
+
+def ranking_candidate_priority(summary: dict[str, Any]) -> tuple[float, float, float, float, float]:
+    return (
+        float(summary.get("selected_xi_regret_mean", float("inf"))),
+        -float(summary.get("top_k_hit_rate_mean", float("-inf"))),
+        -float(summary.get("rank_correlation_mean", float("-inf"))),
+        float(summary.get("rmse", float("inf"))),
+        float(summary.get("mae", float("inf"))),
+    )
+
+
+def extract_feature_importance(bundle: dict[str, Any] | xgb.XGBRegressor, feature_cols: list[str]) -> pd.DataFrame:
+    if isinstance(bundle, xgb.XGBRegressor):
+        importances = np.asarray(bundle.feature_importances_)
+    else:
+        architecture = str(bundle.get("architecture", "shared"))
+        if architecture == "shared":
+            importances = np.asarray(bundle["model"].feature_importances_)
+        elif architecture == "per_position":
+            models = list(bundle.get("models_by_position", {}).values())
+            models.append(bundle["fallback_model"])
+            stacked = [np.asarray(model.feature_importances_) for model in models if hasattr(model, "feature_importances_")]
+            importances = np.mean(stacked, axis=0) if stacked else np.zeros(len(feature_cols), dtype=float)
+        elif architecture == "two_stage_minutes_points":
+            stage_a = np.asarray(bundle["stage_a_classifier"].feature_importances_)
+            stage_b = np.asarray(bundle["stage_b_regressor"].feature_importances_)
+            importances = (stage_a + stage_b) / 2.0
+        else:
+            importances = np.zeros(len(feature_cols), dtype=float)
+    return pd.DataFrame({"feature": feature_cols, "importance": importances}).sort_values("importance", ascending=False)
+
+
 def evaluate_model(model: xgb.XGBRegressor, X: pd.DataFrame, y: pd.Series):
     """
     Evaluate model performance on training data.
@@ -488,7 +1557,7 @@ def evaluate_model(model: xgb.XGBRegressor, X: pd.DataFrame, y: pd.Series):
     }
 
 
-def save_model(model: xgb.XGBRegressor, metrics: dict, output_path: str = "logs/model.bin"):
+def save_model(model: Any, metrics: dict, output_path: str = "logs/model.bin"):
     """
     Save trained model and metadata to disk.
     
@@ -507,8 +1576,12 @@ def save_model(model: xgb.XGBRegressor, metrics: dict, output_path: str = "logs/
             "feature_cols": metrics.get("feature_cols", []),
             "zscore_stats": metrics.get("zscore_stats", {}),
             "position_caps": metrics.get("position_caps", {}),
+            "position_calibration": metrics.get("position_calibration", {}),
+            "calibration_report": metrics.get("calibration_report", {}),
             "train_target_stats": metrics.get("train_target_stats", {}),
             "training_window": metrics.get("training_window", {}),
+            "evaluation_window_summary": metrics.get("evaluation_window_summary", {}),
+            "trusted_gameweek_policy_version": metrics.get("trusted_gameweek_policy_version"),
         }
     )
 
@@ -546,6 +1619,24 @@ def save_model(model: xgb.XGBRegressor, metrics: dict, output_path: str = "logs/
                     f"count={row['count']}\n"
                 )
             f.write("\n")
+        weekly_summary = metrics.get("evaluation_window_summary") or {}
+        if weekly_summary:
+            f.write("Weekly Backtest Summary:\n")
+            f.write(f"  weeks={weekly_summary.get('weekly_count', 0)}\n")
+            f.write(f"  top_k_hit_rate_mean={weekly_summary.get('top_k_hit_rate_mean', 0.0):.3f}\n")
+            f.write(f"  rank_correlation_mean={weekly_summary.get('rank_correlation_mean', 0.0):.3f}\n")
+            f.write(f"  selected_xi_regret_mean={weekly_summary.get('selected_xi_regret_mean', 0.0):.3f}\n")
+            f.write(
+                f"  prediction_collapse_weeks={weekly_summary.get('prediction_collapse_weeks', 0)}\n\n"
+            )
+        calibration_report = metrics.get("calibration_report") or {}
+        if calibration_report:
+            selected_delta = calibration_report.get("selected_delta") or {}
+            f.write("Calibration Summary:\n")
+            f.write(f"  selected_variant={calibration_report.get('selected_variant', 'none')}\n")
+            f.write(f"  delta_mae={float(selected_delta.get('mae', 0.0)):.3f}\n")
+            f.write(f"  delta_rmse={float(selected_delta.get('rmse', 0.0)):.3f}\n")
+            f.write(f"  delta_bias={float(selected_delta.get('bias', 0.0)):.3f}\n\n")
         f.write("Top 10 Features:\n")
         for idx, row in metrics['feature_importance'].head(10).iterrows():
             f.write(f"  {row['feature']:40s} {row['importance']:.4f}\n")
@@ -567,8 +1658,20 @@ def main():
     # 2. Engineer base features
     df = engineer_features(df)
     
-    # 3. Train/holdout split by target gameweek
-    train_df, holdout_df = split_train_holdout(df, HOLDOUT_GAMEWEEKS)
+    # 3. Train/holdout split by trusted gameweek policy
+    rules_path = os.getenv("DOMAIN_RULES_PATH", "config/domain_rules.yaml")
+    gameweek_policy = load_gameweek_quality_policy(rules_path)
+    train_df, holdout_df = split_train_holdout(
+        df,
+        HOLDOUT_GAMEWEEKS,
+        gameweek_policy=gameweek_policy,
+    )
+    logger.info(
+        "Applied gameweek quality policy version=%s excluded=%s untrusted=%s",
+        gameweek_policy.get("policy_version"),
+        gameweek_policy.get("excluded_gameweeks"),
+        gameweek_policy.get("backfilled_but_untrusted_gameweeks"),
+    )
     
     # 4. Z-score normalisation using training-only global stats
     global_stats = compute_global_stats(train_df)
@@ -576,7 +1679,8 @@ def main():
     holdout_df = add_z_scores(holdout_df, global_stats)
     
     # 5. Select features and target
-    features = select_features()
+    experiment_variant = resolve_experiment_variant()
+    features = select_features(experiment_variant)
     
     # Check which features exist in the data
     available_features = [f for f in features if f in train_df.columns]
@@ -607,24 +1711,65 @@ def main():
     logger.info(f"Training target mean: {y_train.mean():.2f} points")
     
     # 6. Train model
-    model = train_xgboost_model(X_train, y_train)
+    model = train_prediction_bundle(
+        train_df,
+        available_features,
+        variant=experiment_variant,
+        use_log_target=LOG_TARGET,
+    )
     
     # 7. Evaluate on training data
-    metrics = evaluate_model(model, X_train, y_train)
+    metrics = evaluate_model(
+        model["model"] if isinstance(model, dict) and model.get("architecture") == "shared" else (
+            model["fallback_model"] if isinstance(model, dict) and model.get("architecture") == "per_position" else model["stage_b_regressor"]
+        ),
+        X_train,
+        y_train,
+    )
     
     # 8. Holdout evaluation with shrinkage and optional calibration
     league_mean = float(y_train.mean())
-    holdout_pred = model.predict(X_holdout)
-    holdout_pred = apply_shrinkage(holdout_pred, league_mean, SHRINKAGE_ALPHA)
-    
-    calibration = None
-    if ENABLE_CALIBRATION:
-        a, b = fit_calibration(y_holdout.to_numpy(), holdout_pred)
-        a, b = blend_calibration(a, b, CALIBRATION_STRENGTH)
-        holdout_pred = apply_calibration(holdout_pred, a, b)
-        calibration = {'a': a, 'b': b}
-    
-    holdout_pred = np.maximum(holdout_pred, 0)
+    holdout_pred_raw = predict_prediction_bundle(
+        model,
+        holdout_df,
+        available_features,
+        use_log_target=LOG_TARGET,
+    )
+    holdout_pred_raw = apply_shrinkage(holdout_pred_raw, league_mean, SHRINKAGE_ALPHA)
+
+    train_pred_raw = predict_prediction_bundle(
+        model,
+        train_df,
+        available_features,
+        use_log_target=LOG_TARGET,
+    )
+    train_pred_raw = apply_shrinkage(train_pred_raw, league_mean, SHRINKAGE_ALPHA)
+
+    calibration_result = select_calibration_variant(
+        y_train=y_train.to_numpy(),
+        train_pred=np.asarray(train_pred_raw),
+        y_holdout=y_holdout.to_numpy(),
+        holdout_pred=np.asarray(holdout_pred_raw),
+        train_position_ids=train_df['position_id'].to_numpy() if 'position_id' in train_df.columns else None,
+        holdout_position_ids=holdout_df['position_id'].to_numpy() if 'position_id' in holdout_df.columns else None,
+        strength=CALIBRATION_STRENGTH if ENABLE_CALIBRATION else 0.0,
+        min_samples=POSITION_CALIBRATION_MIN_SAMPLES,
+    )
+    calibration = calibration_result["calibration"]
+    position_calibration = calibration_result["position_calibration"]
+    calibration_comparison = calibration_result["calibration_comparison"]
+    calibration_report = calibration_result["calibration_report"]
+    selected_variant = calibration_result["selected_variant"]
+    holdout_pred = apply_prediction_post_processing(
+        np.asarray(holdout_pred_raw),
+        league_mean=None,
+        shrinkage_alpha=0.0,
+        calibration=calibration,
+        position_calibration=position_calibration,
+        selected_variant=selected_variant,
+        position_ids=holdout_df['position_id'].to_numpy() if 'position_id' in holdout_df.columns else None,
+        position_caps=None,
+    )
     
     holdout_mae = mean_absolute_error(y_holdout, holdout_pred)
     holdout_rmse = np.sqrt(mean_squared_error(y_holdout, holdout_pred))
@@ -663,12 +1808,41 @@ def main():
     print_group_bias(holdout_context, y_holdout.to_numpy(), holdout_pred, 'position_id', "Holdout")
     print_group_bias(holdout_context, y_holdout.to_numpy(), holdout_pred, 'minutes_band', "Holdout")
     
+    backtest_report = build_weekly_backtest_report(
+        holdout_df,
+        y_holdout.to_numpy(),
+        holdout_pred,
+        gameweek_policy=gameweek_policy,
+        model_rules=load_model_rules(rules_path),
+    )
+    backtest_report = add_baseline_comparison_to_report(
+        backtest_report,
+        holdout_df.assign(predicted_points=holdout_pred),
+        y_holdout.to_numpy(),
+        gameweek_policy=gameweek_policy,
+        model_rules=load_model_rules(rules_path),
+    )
+    publication_status = evaluate_publication_readiness(
+        backtest_report,
+        calibration_report=calibration_report,
+        model_rules=load_model_rules(rules_path),
+    )
+    report_path = write_weekly_backtest_report(backtest_report, "logs/model_weekly_report.json")
+    logger.info("Weekly backtest report written to %s", report_path)
+    logger.info("Weekly backtest summary: %s", backtest_report["summary"])
+    logger.info("Forward publication ready=%s reasons=%s", publication_status["ready"], publication_status["reasons"])
+
     metrics['holdout_mae'] = holdout_mae
     metrics['holdout_rmse'] = holdout_rmse
     metrics['holdout_bias'] = holdout_bias
     metrics['holdout_p95_by_position'] = holdout_p95_by_position
     metrics['zscore_stats'] = global_stats
     metrics['feature_cols'] = available_features
+    metrics['position_calibration'] = position_calibration
+    metrics['calibration_report'] = calibration_report
+    metrics['evaluation_window_summary'] = backtest_report['summary']
+    metrics['baseline_comparison'] = backtest_report.get('baseline_comparison', {})
+    metrics['trusted_gameweek_policy_version'] = gameweek_policy.get('policy_version')
 
     position_caps = {}
     if 'position_id' in train_df.columns:
@@ -693,7 +1867,21 @@ def main():
         'reg_lambda': REG_LAMBDA,
         'max_depth': MAX_DEPTH,
         'holdout_gameweeks': HOLDOUT_GAMEWEEKS,
-        'calibration': calibration
+        'experiment_variant': experiment_variant,
+        'calibration': calibration,
+        'calibration_comparison': calibration_comparison,
+        'calibration_report': calibration_report,
+        'backtest_report_path': report_path,
+        'baseline_comparison': backtest_report.get('baseline_comparison', {}),
+        'recent_validation_gameweeks': backtest_report.get('recent_validation_gameweeks', []),
+        'baseline_gate_passed': publication_status['gates'].get('baseline_gate_passed', True),
+        'baseline_metric_deltas': (backtest_report.get('required_baseline_comparison') or {}).get('metric_deltas', {}),
+        'gameweek_policy_version': gameweek_policy.get('policy_version'),
+        'use_log_target': LOG_TARGET,
+        'selected_calibration_variant': selected_variant,
+        'forward_publish_ready': publication_status['ready'],
+        'forward_publish_gates': publication_status['gates'],
+        'forward_publish_reasons': publication_status['reasons'],
     }
     
     # 9. Save

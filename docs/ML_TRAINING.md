@@ -8,7 +8,7 @@ The ML pipeline:
 1. Fetches historical player features from `fct_ml_player_features` in Snowflake
 2. Engineers temporal features and creates training targets
 3. Trains an XGBoost regressor with time series cross-validation
-4. Evaluates a temporal holdout set and reports bias
+4. Evaluates a temporal holdout set and reports bias, calibration deltas, and weekly realism/ranking metrics
 5. Saves the model and metadata to `model.bin` for inference
 
 ## Training the Model
@@ -122,12 +122,35 @@ The `run_ml_inference` task will:
 4. Generate predictions for all players
 5. Output predictions to `recommended_squad` table
 
+If the active artefact fails the local publication gates saved in model metadata, inference now refuses to emit forward predictions. This is intentional: the pipeline keeps the model available for retrospective evaluation, but blocks forward squad publication until the ranking and regret gates pass.
+
 ### Fallback Behaviour
 
 If `logs/model.bin` doesn't exist, the pipeline falls back to heuristic predictions:
 ```python
 predicted_points = 0.7 * rolling_avg + 1.5 * z_score + 2.0
 ```
+
+The missing-model heuristic is not used when an existing model artefact is explicitly marked invalid for forward publication. In that case the pipeline returns no predictions so a weak model cannot silently continue driving squad output.
+
+## March 2026 Stabilisation Changes
+
+The current recovery pass adds a local-only safety layer around training, replay, and inference:
+
+- target engineering now drops missing shifted targets before numeric fill and fails fast if invalid target rows survive
+- duplicate `player_id`/`gameweek_id` rows are collapsed before target shift so double-gameweek fixture rows do not poison the target
+- `form` has been removed from the active feature set for the stabilisation cycle
+- calibration selection now treats `none` as the baseline and rejects harmful calibrated variants
+- point-in-time backfill and live inference now share the same post-processing contract
+- weekly backtest output now includes oracle-versus-selected XI evidence needed for re-enable decisions
+- forward publication is blocked unless the rebuilt artefact clears the local ranking, regret, collapse, and calibration gates
+
+Validated locally after the recovery pass:
+
+- local-only training completed from `pipeline/data/training/latest.parquet`
+- test suite passed for ML helpers, calibration/reporting, PIT backfill, and gate enforcement
+- the rebuilt artefact selected `none` for calibration and removed prediction collapse
+- the rebuilt artefact still failed the strict re-enable bar on ranking, so `forward_publish_ready=false` remains the correct state
 
 ## Model Features
 
@@ -159,7 +182,7 @@ predicted_points = 0.7 * rolling_avg + 1.5 * z_score + 2.0
 - `team_position`, `opponent_team_position`, `team_position_difference`
 
 **Player Metadata:**
-- `form`, `now_cost`
+- `now_cost`
 
 **Engineered Features:**
 - Z-scores for `total_points`, `minutes_played`, `ict_index`
@@ -225,6 +248,34 @@ python scripts/train_model.py
 # Then run pipeline to generate new predictions
 python scripts/run_once.py
 ```
+
+## Manual Gameweek Trust Workflow
+
+Gameweek trust is managed manually in `config/domain_rules.yaml` under `gameweek_quality`:
+
+1. Keep polluted weeks in `excluded_gameweeks` and `backfilled_but_untrusted_gameweeks`.
+2. Rebuild with point-in-time backfill:
+   ```bash
+   python scripts/backfill_recommended_squad_pit.py --gameweeks 27 28
+   ```
+3. Review trust metadata in `recommended_squad` (`backfill_trusted`, `backfill_validation_status`, `backfill_validation_details`).
+4. Manually update `config/domain_rules.yaml`:
+   - remove validated weeks from `excluded_gameweeks`
+   - remove validated weeks from `backfilled_but_untrusted_gameweeks`
+   - add validated weeks to `trusted_backfilled_gameweeks`
+5. Re-run training and autonomous evaluation after the manual rule update.
+
+No automatic trust promotion is performed.
+
+## Weekly Baseline Artifacts
+
+Promotion decisions should use pipeline artifacts, not dashboard-only review:
+
+- `logs/model_weekly_report.json` from `scripts/train_model.py`
+- `logs/autonomous/<run_id>.weekly_report.json` from autonomous evaluation
+- autonomous evidence bundle with per-week/per-position metrics and calibration report
+
+`model_weekly_report.json` now includes prediction collapse and instability (`bias_flip_weeks`) signals.
 
 ## Monitoring
 

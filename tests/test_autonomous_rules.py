@@ -14,9 +14,10 @@ DEFAULT_RULES = ROOT / "config" / "domain_rules.yaml"
 
 def test_default_rules_file_is_schema_valid():
     rules = load_domain_rules(DEFAULT_RULES)
-    assert rules["version"] == "1.0.0"
+    assert rules["version"] == "1.2.0"
     assert "schema" in rules
     assert "drift" in rules
+    assert "gameweek_quality" in rules
 
 
 def test_invalid_rules_file_fails_fast(tmp_path):

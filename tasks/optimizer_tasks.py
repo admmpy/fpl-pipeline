@@ -232,7 +232,7 @@ class SquadOptimizer:
         logger.info(f"Solving optimization problem with {self.solver}")
         prob.solve(solver=self.solver)
         
-        if prob.status != "optimal":
+        if prob.status not in {"optimal", "optimal_inaccurate"}:
             raise ValueError(f"Problem could not be solved: {prob.status}")
             
         # Extract results

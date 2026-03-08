@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Autonomous Domain Rules",
   "type": "object",
-  "required": ["version", "schema", "split", "drift", "optimisation", "model"],
+  "required": ["version", "schema", "split", "gameweek_quality", "drift", "optimisation", "model"],
   "additionalProperties": false,
   "properties": {
     "version": {"type": "string", "minLength": 1},
@@ -53,6 +53,46 @@
         }
       }
     },
+    "gameweek_quality": {
+      "type": "object",
+      "required": [
+        "policy_version",
+        "excluded_gameweeks",
+        "backfilled_but_untrusted_gameweeks",
+        "trusted_backfilled_gameweeks",
+        "eligible_training_gameweeks",
+        "eligible_holdout_backtest_gameweeks"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "policy_version": {"type": "string", "minLength": 1},
+        "excluded_gameweeks": {
+          "type": "array",
+          "items": {"type": "integer", "minimum": 1},
+          "uniqueItems": true
+        },
+        "backfilled_but_untrusted_gameweeks": {
+          "type": "array",
+          "items": {"type": "integer", "minimum": 1},
+          "uniqueItems": true
+        },
+        "trusted_backfilled_gameweeks": {
+          "type": "array",
+          "items": {"type": "integer", "minimum": 1},
+          "uniqueItems": true
+        },
+        "eligible_training_gameweeks": {
+          "type": "array",
+          "items": {"type": "integer", "minimum": 1},
+          "uniqueItems": true
+        },
+        "eligible_holdout_backtest_gameweeks": {
+          "type": "array",
+          "items": {"type": "integer", "minimum": 1},
+          "uniqueItems": true
+        }
+      }
+    },
     "drift": {
       "type": "object",
       "required": ["columns", "ks_threshold", "breach_ratio"],
@@ -80,7 +120,20 @@
         "max_abs_bias",
         "max_position_exceed_rate",
         "max_player_exceed_rate",
-        "rmse_deterioration_pct"
+        "rmse_deterioration_pct",
+        "max_squad_total_bias",
+        "max_position_bias",
+        "min_top_k_hit_rate",
+        "min_rank_correlation",
+        "max_selected_xi_regret",
+        "max_prediction_collapse_weeks",
+        "max_bias_flip_weeks",
+        "instability_bias_abs_threshold",
+        "min_prediction_to_actual_ratio",
+        "max_prediction_to_actual_ratio",
+        "required_baseline",
+        "baseline_gate_metrics",
+        "min_position_calibration_gain"
       ],
       "additionalProperties": false,
       "properties": {
@@ -89,7 +142,28 @@
         "max_abs_bias": {"type": "number", "minimum": 0.0},
         "max_position_exceed_rate": {"type": "number", "minimum": 0.0, "maximum": 1.0},
         "max_player_exceed_rate": {"type": "number", "minimum": 0.0, "maximum": 1.0},
-        "rmse_deterioration_pct": {"type": "number", "minimum": 0.0, "maximum": 1.0}
+        "rmse_deterioration_pct": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+        "max_squad_total_bias": {"type": "number", "minimum": 0.0},
+        "max_position_bias": {"type": "number", "minimum": 0.0},
+        "min_top_k_hit_rate": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+        "min_rank_correlation": {"type": "number", "minimum": -1.0, "maximum": 1.0},
+        "max_selected_xi_regret": {"type": "number", "minimum": 0.0},
+        "max_prediction_collapse_weeks": {"type": "integer", "minimum": 0},
+        "max_bias_flip_weeks": {"type": "integer", "minimum": 0},
+        "instability_bias_abs_threshold": {"type": "number", "minimum": 0.0},
+        "min_prediction_to_actual_ratio": {"type": "number", "exclusiveMinimum": 0.0},
+        "max_prediction_to_actual_ratio": {"type": "number", "exclusiveMinimum": 0.0},
+        "required_baseline": {"type": "string", "minLength": 1},
+        "baseline_gate_metrics": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "enum": ["top_k_hit_rate_mean", "selected_xi_regret_mean"]
+          },
+          "uniqueItems": true
+        },
+        "min_position_calibration_gain": {"type": "number"}
       }
     }
   }
