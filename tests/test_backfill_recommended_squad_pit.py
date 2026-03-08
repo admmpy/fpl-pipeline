@@ -114,3 +114,56 @@ def test_backfill_prediction_path_uses_shared_post_processing():
     assert predictions
     assert metadata["selected_calibration_variant"] == "none"
     assert set(metadata["position_caps"]) == {1, 2, 3, 4}
+
+
+def test_backfill_gameweek_replaces_existing_rows(monkeypatch):
+    deleted = []
+    loaded = []
+
+    monkeypatch.setattr(
+        pit,
+        "_train_point_in_time_model",
+        lambda train_df, feature_cols: (
+            _DummyModel(),
+            {
+                "league_mean": 4.0,
+                "shrinkage_alpha": 0.0,
+                "selected_calibration_variant": "none",
+                "calibration": None,
+                "position_calibration": None,
+                "position_caps": {},
+                "use_log_target": False,
+            },
+        ),
+    )
+    monkeypatch.setattr(pit, "_delete_existing_gameweek_rows", lambda target_gw: deleted.append(target_gw) or 15)
+    monkeypatch.setattr(pit, "insert_typed_records", lambda table_name, squad: loaded.append((table_name, len(squad))) or len(squad))
+
+    def _fake_optimize(predictions):
+        squad = []
+        for row in predictions[:15]:
+            squad.append(
+                {
+                    **row,
+                    "is_in_squad": True,
+                    "is_starter": len(squad) < 11,
+                    "is_captain": len(squad) == 0,
+                    "is_vice_captain": len(squad) == 1,
+                    "expected_points_5_gw": row["expected_points_next_gw"] * 5,
+                }
+            )
+        return squad
+
+    monkeypatch.setattr(pit.optimize_squad_task, "fn", _fake_optimize)
+
+    result = pit.backfill_gameweek(
+        feature_df=_feature_df(),
+        target_gw=7,
+        dry_run=False,
+        timestamp_prefix="2026-01-01 00:00:00",
+        validation_version="policy-v1",
+    )
+
+    assert deleted == [7]
+    assert loaded == [("recommended_squad", 15)]
+    assert result["loaded_rows"] == 15

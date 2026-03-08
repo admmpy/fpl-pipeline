@@ -63,7 +63,7 @@ BASELINE_FEATURE_COLUMNS = (
     "three_week_players_roll_avg_points",
     "total_points_z_score",
 )
-DEFAULT_EXPERIMENT_VARIANT = "shared_default"
+DEFAULT_EXPERIMENT_VARIANT = "shared_no_minute_bands"
 EXPERIMENT_SEQUENCE = (
     "shared_no_minute_bands",
     "shared_minutes_continuous_only",
@@ -1150,9 +1150,17 @@ def evaluate_publication_readiness(
         "calibration_safe_mae": float(calibration_delta.get("mae", 0.0)) <= CALIBRATION_METRIC_TOLERANCE,
         "calibration_safe_rmse": float(calibration_delta.get("rmse", 0.0)) <= CALIBRATION_METRIC_TOLERANCE,
     }
-    ready = all(gates.values())
+    override_enabled = bool((model_rules or {}).get("allow_forward_publish_override", False))
+    raw_ready = all(gates.values())
+    ready = raw_ready or override_enabled
     reasons = [name for name, passed in gates.items() if not passed]
-    return {"ready": ready, "gates": gates, "reasons": reasons}
+    return {
+        "ready": ready,
+        "gates": gates,
+        "reasons": reasons,
+        "override_enabled": override_enabled,
+        "override_forced_ready": bool(override_enabled and not raw_ready),
+    }
 
 
 def write_weekly_backtest_report(report: dict[str, Any], path: str) -> str:
@@ -1880,6 +1888,8 @@ def main():
         'use_log_target': LOG_TARGET,
         'selected_calibration_variant': selected_variant,
         'forward_publish_ready': publication_status['ready'],
+        'forward_publish_override_enabled': publication_status.get('override_enabled', False),
+        'forward_publish_override_forced_ready': publication_status.get('override_forced_ready', False),
         'forward_publish_gates': publication_status['gates'],
         'forward_publish_reasons': publication_status['reasons'],
     }
