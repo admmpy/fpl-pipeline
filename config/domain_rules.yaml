@@ -73,4 +73,5 @@ model:
   baseline_gate_metrics:
     - top_k_hit_rate_mean
     - selected_xi_regret_mean
+  allow_forward_publish_override: true
   min_position_calibration_gain: 0.0

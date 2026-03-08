@@ -270,6 +270,21 @@ def _ensure_table_and_marker_column() -> None:
         cursor.close()
 
 
+def _delete_existing_gameweek_rows(target_gw: int) -> int:
+    with get_snowflake_connection() as conn:
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "DELETE FROM recommended_squad WHERE gameweek_id = %s",
+                (target_gw,),
+            )
+            deleted = int(cursor.rowcount or 0)
+            conn.commit()
+            return deleted
+        finally:
+            cursor.close()
+
+
 def _parse_timestamp_prefix(raw_value: str) -> datetime:
     try:
         return datetime.strptime(raw_value, "%Y-%m-%d %H:%M:%S")
@@ -321,6 +336,7 @@ def backfill_gameweek(
 
     loaded = 0
     if not dry_run:
+        _delete_existing_gameweek_rows(target_gw)
         loaded = insert_typed_records("recommended_squad", squad)
 
     return {

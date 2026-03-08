@@ -133,6 +133,7 @@
         "max_prediction_to_actual_ratio",
         "required_baseline",
         "baseline_gate_metrics",
+        "allow_forward_publish_override",
         "min_position_calibration_gain"
       ],
       "additionalProperties": false,
@@ -163,6 +164,7 @@
           },
           "uniqueItems": true
         },
+        "allow_forward_publish_override": {"type": "boolean"},
         "min_position_calibration_gain": {"type": "number"}
       }
     }

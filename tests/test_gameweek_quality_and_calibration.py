@@ -10,6 +10,7 @@ from scripts.train_model import (
     build_calibration_report,
     build_weekly_backtest_report,
     compute_focus_position_abs_bias,
+    evaluate_publication_readiness,
     apply_position_aware_calibration,
     fit_position_aware_calibration,
     split_train_holdout,
@@ -191,3 +192,47 @@ def test_baseline_comparison_marks_required_baseline_failure():
 
     assert report["required_baseline"] == "five_week_players_roll_avg_points"
     assert report["required_baseline_comparison"]["baseline_gate_passed"] is False
+
+
+def test_publication_readiness_can_be_forced_ready_with_override():
+    report = {
+        "summary": {
+            "prediction_collapse_weeks": 0,
+            "bias_flip_weeks": 0,
+            "top_k_hit_rate_mean": 0.16,
+            "rank_correlation_mean": 0.05,
+            "selected_xi_regret_mean": 88.2,
+            "prediction_to_actual_ratio_min": 0.8,
+            "prediction_to_actual_ratio_max": 1.2,
+        },
+        "required_baseline_comparison": {
+            "baseline_gate_passed": True,
+            "model_summary": {
+                "top_k_hit_rate_mean": 0.16,
+                "selected_xi_regret_mean": 88.2,
+            },
+            "baseline_summary": {
+                "top_k_hit_rate_mean": 0.10,
+                "selected_xi_regret_mean": 96.0,
+            },
+        },
+    }
+
+    readiness = evaluate_publication_readiness(
+        report,
+        model_rules={
+            "min_top_k_hit_rate": 0.25,
+            "min_rank_correlation": 0.0,
+            "max_selected_xi_regret": 24.0,
+            "max_prediction_collapse_weeks": 0,
+            "max_bias_flip_weeks": 0,
+            "min_prediction_to_actual_ratio": 0.6,
+            "max_prediction_to_actual_ratio": 1.6,
+            "allow_forward_publish_override": True,
+        },
+    )
+
+    assert readiness["ready"] is True
+    assert readiness["override_enabled"] is True
+    assert readiness["override_forced_ready"] is True
+    assert "min_top_k_hit_rate" in readiness["reasons"]
