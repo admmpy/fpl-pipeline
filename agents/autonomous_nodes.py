@@ -286,8 +286,16 @@ def _ensure_targets(df: pd.DataFrame) -> pd.DataFrame:
     return prepared
 
 
-def _prepare_train_holdout(df: pd.DataFrame, holdout_gameweeks: int) -> tuple[pd.DataFrame, pd.DataFrame, list[str], dict[str, Any]]:
-    train_df, holdout_df = train_model.split_train_holdout(df, holdout_gameweeks)
+def _prepare_train_holdout(
+    df: pd.DataFrame,
+    holdout_gameweeks: int,
+    gameweek_policy: Optional[dict[str, Any]] = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, list[str], dict[str, Any]]:
+    train_df, holdout_df = train_model.split_train_holdout(
+        df,
+        holdout_gameweeks,
+        gameweek_policy=gameweek_policy,
+    )
     global_stats = train_model.compute_global_stats(train_df)
     train_df = train_model.add_z_scores(train_df, global_stats)
     holdout_df = train_model.add_z_scores(holdout_df, global_stats)
@@ -301,11 +309,25 @@ def _prepare_train_holdout(df: pd.DataFrame, holdout_gameweeks: int) -> tuple[pd
     return train_df, holdout_df, features, global_stats
 
 
+def _balanced_candidate_score(summary: dict[str, Any]) -> float:
+    mae = float(summary.get("mae", float("inf")))
+    score = mae
+    score += 0.05 * float(summary.get("squad_total_bias_abs_mean", 0.0))
+    score += 0.03 * float(summary.get("selected_xi_regret_mean", 0.0))
+    score += 1.5 * max(0.0, 0.30 - float(summary.get("top_k_hit_rate_mean", 0.0)))
+    score += 1.0 * max(0.0, 0.10 - float(summary.get("rank_correlation_mean", 0.0)))
+    score += 2.0 * float(summary.get("prediction_collapse_weeks", 0))
+    return float(score)
+
+
 def _fit_predict(
     train_df: pd.DataFrame,
     holdout_df: pd.DataFrame,
     features: list[str],
     params: dict[str, Any],
+    *,
+    gameweek_policy: Optional[dict[str, Any]] = None,
+    model_rules: Optional[dict[str, Any]] = None,
 ) -> tuple[xgb.XGBRegressor, np.ndarray, dict[str, Any]]:
     X_train = train_df[features].fillna(0)
     y_train = train_df["target_next_gw_points"]
@@ -341,23 +363,59 @@ def _fit_predict(
     holdout_pred = model.predict(X_holdout)
     if use_log_target:
         holdout_pred = train_model._inverse_transform(holdout_pred)
+    holdout_pred = np.asarray(holdout_pred)
+
+    train_pred = model.predict(X_train)
+    if use_log_target:
+        train_pred = train_model._inverse_transform(train_pred)
+    train_pred = np.asarray(train_pred)
 
     league_mean = float(y_train.mean())
     holdout_pred = train_model.apply_shrinkage(holdout_pred, league_mean, shrinkage_alpha)
+    train_pred = train_model.apply_shrinkage(train_pred, league_mean, shrinkage_alpha)
+    holdout_pred_pre_calibration = np.asarray(holdout_pred).copy()
 
-    calibration_payload = {"a": 1.0, "b": 0.0, "strength": calibration_strength}
-    if calibration_strength > 0:
-        a, b = train_model.fit_calibration(y_holdout.to_numpy(), holdout_pred)
-        a, b = train_model.blend_calibration(a, b, calibration_strength)
-        holdout_pred = train_model.apply_calibration(holdout_pred, a, b)
-        calibration_payload = {"a": float(a), "b": float(b), "strength": calibration_strength}
+    calibration_result = train_model.select_calibration_variant(
+        y_train=y_train.to_numpy(),
+        train_pred=np.asarray(train_pred),
+        y_holdout=y_holdout.to_numpy(),
+        holdout_pred=np.asarray(holdout_pred_pre_calibration),
+        train_position_ids=train_df["position_id"].to_numpy() if "position_id" in train_df.columns else None,
+        holdout_position_ids=holdout_df["position_id"].to_numpy() if "position_id" in holdout_df.columns else None,
+        strength=calibration_strength,
+    )
+    calibration_payload = calibration_result["calibration"]
+    position_calibration_payload = calibration_result["position_calibration"]
+    calibration_comparison = calibration_result["calibration_comparison"]
+    calibration_report = calibration_result["calibration_report"]
+    selected_variant = calibration_result["selected_variant"]
 
-    holdout_pred = np.maximum(holdout_pred, 0)
+    holdout_pred = train_model.apply_prediction_post_processing(
+        np.asarray(holdout_pred_pre_calibration),
+        calibration=calibration_payload,
+        position_calibration=position_calibration_payload,
+        selected_variant=selected_variant,
+        position_ids=holdout_df["position_id"].to_numpy() if "position_id" in holdout_df.columns else None,
+    )
+
+    backtest = train_model.build_weekly_backtest_report(
+        holdout_df,
+        y_holdout.to_numpy(),
+        holdout_pred,
+        gameweek_policy=gameweek_policy,
+        model_rules=model_rules,
+    )
 
     post = {
         "league_mean": league_mean,
         "shrinkage_alpha": shrinkage_alpha,
         "calibration": calibration_payload,
+        "position_calibration": position_calibration_payload,
+        "selected_calibration_variant": selected_variant,
+        "calibration_comparison": calibration_comparison,
+        "calibration_report": calibration_report,
+        "backtest": backtest,
+        "use_log_target": use_log_target,
     }
     return model, holdout_pred, post
 
@@ -366,7 +424,10 @@ def _evaluate_payload(
     payload: Any,
     holdout_df: pd.DataFrame,
     features: list[str],
-) -> dict[str, float]:
+    *,
+    gameweek_policy: Optional[dict[str, Any]] = None,
+    model_rules: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
     if isinstance(payload, dict):
         model = payload.get("model")
         metadata = payload.get("metadata", {})
@@ -380,26 +441,32 @@ def _evaluate_payload(
     X_holdout = holdout_df[features].fillna(0)
     y_holdout = holdout_df["target_next_gw_points"]
     pred = model.predict(X_holdout)
+    if bool(metadata.get("use_log_target", False)):
+        pred = train_model._inverse_transform(np.asarray(pred))
 
-    league_mean = metadata.get("league_mean")
-    if league_mean is not None:
-        pred = train_model.apply_shrinkage(
-            np.asarray(pred), float(league_mean), float(metadata.get("shrinkage_alpha", 0.0))
-        )
-
-    calibration = metadata.get("calibration")
-    if calibration:
-        pred = train_model.apply_calibration(
-            np.asarray(pred),
-            float(calibration.get("a", 1.0)),
-            float(calibration.get("b", 0.0)),
-        )
-
-    pred = np.maximum(pred, 0)
+    pred = train_model.apply_prediction_post_processing(
+        np.asarray(pred),
+        league_mean=metadata.get("league_mean"),
+        shrinkage_alpha=float(metadata.get("shrinkage_alpha", 0.0)),
+        calibration=metadata.get("calibration"),
+        position_calibration=metadata.get("position_calibration"),
+        selected_variant=str(metadata.get("selected_calibration_variant", "none")),
+        position_ids=holdout_df["position_id"].to_numpy() if "position_id" in holdout_df.columns else None,
+        position_caps=metadata.get("position_caps"),
+    )
+    backtest = train_model.build_weekly_backtest_report(
+        holdout_df,
+        y_holdout.to_numpy(),
+        pred,
+        gameweek_policy=gameweek_policy,
+        model_rules=model_rules,
+    )
     return {
         "mae": float(mean_absolute_error(y_holdout, pred)),
         "rmse": float(np.sqrt(mean_squared_error(y_holdout, pred))),
         "bias": float((y_holdout - pred).mean()),
+        "summary": backtest.get("summary", {}),
+        "backtest": backtest,
     }
 
 
@@ -582,7 +649,12 @@ def validate_snapshot(state: AutonomousState) -> dict[str, Any]:
             }
 
         holdout_gameweeks = int(split_rules["holdout_gameweeks"])
-        train_df, holdout_df, features, global_stats = _prepare_train_holdout(df, holdout_gameweeks)
+        gameweek_policy = dict(rules.get("gameweek_quality") or {})
+        train_df, holdout_df, features, global_stats = _prepare_train_holdout(
+            df,
+            holdout_gameweeks,
+            gameweek_policy=gameweek_policy,
+        )
 
         snapshot_meta = dict(state.get("snapshot_meta") or {})
         snapshot_meta.update(
@@ -591,6 +663,7 @@ def validate_snapshot(state: AutonomousState) -> dict[str, Any]:
                 "holdout_df": holdout_df,
                 "features": features,
                 "global_stats": global_stats,
+                "gameweek_policy": gameweek_policy,
             }
         )
 
@@ -600,6 +673,7 @@ def validate_snapshot(state: AutonomousState) -> dict[str, Any]:
             "checked_at_utc": _now_utc(),
             "train_rows": int(len(train_df)),
             "holdout_rows": int(len(holdout_df)),
+            "gameweek_policy_version": gameweek_policy.get("policy_version"),
         }
 
         _node_log(
@@ -723,6 +797,10 @@ def run_optuna_search(state: AutonomousState) -> dict[str, Any]:
         train_df = snapshot_meta.get("train_df")
         holdout_df = snapshot_meta.get("holdout_df")
         features = snapshot_meta.get("features")
+        gameweek_policy = snapshot_meta.get("gameweek_policy") or {}
+        rules = _rules_from_state(state)
+        model_rules = dict(rules.get("model") or {})
+        gameweek_policy = snapshot_meta.get("gameweek_policy") or {}
         if not isinstance(train_df, pd.DataFrame) or not isinstance(holdout_df, pd.DataFrame):
             raise ValueError("Train/holdout frames missing for Optuna search")
         if not isinstance(features, list) or not features:
@@ -731,6 +809,7 @@ def run_optuna_search(state: AutonomousState) -> dict[str, Any]:
         trials = int(snapshot_meta.get("optuna_trials") or rules["optimisation"]["optuna_trials"])
         seed = int(rules["optimisation"]["random_seed"])
         y_holdout = holdout_df["target_next_gw_points"]
+        model_rules = dict(rules.get("model") or {})
 
         def objective(trial: Any) -> float:
             params = {
@@ -747,8 +826,17 @@ def run_optuna_search(state: AutonomousState) -> dict[str, Any]:
                 "shrinkage_alpha": trial.suggest_float("shrinkage_alpha", 0.0, 0.5),
                 "calibration_strength": trial.suggest_float("calibration_strength", 0.0, 1.0),
             }
-            _, pred, _ = _fit_predict(train_df, holdout_df, features, params)
-            return float(mean_absolute_error(y_holdout, pred))
+            _, pred, post = _fit_predict(
+                train_df,
+                holdout_df,
+                features,
+                params,
+                gameweek_policy=gameweek_policy,
+                model_rules=model_rules,
+            )
+            summary = dict(post.get("backtest", {}).get("summary") or {})
+            summary["mae"] = float(mean_absolute_error(y_holdout, pred))
+            return _balanced_candidate_score(summary)
 
         sampler = optuna.samplers.TPESampler(seed=seed)
         study = optuna.create_study(direction="minimize", sampler=sampler)
@@ -785,10 +873,13 @@ def train_best_candidate(state: AutonomousState) -> dict[str, Any]:
     try:
         guard_node_state(state, node_name="train_best_candidate", allowed_states={"SEARCHED"})
 
+        rules = _rules_from_state(state)
         snapshot_meta = dict(state.get("snapshot_meta") or {})
         train_df = snapshot_meta.get("train_df")
         holdout_df = snapshot_meta.get("holdout_df")
         features = snapshot_meta.get("features")
+        gameweek_policy = snapshot_meta.get("gameweek_policy") or dict(rules.get("gameweek_quality") or {})
+        model_rules = dict(rules.get("model") or {})
 
         if not isinstance(train_df, pd.DataFrame) or not isinstance(holdout_df, pd.DataFrame):
             raise ValueError("Train/holdout frames missing for training")
@@ -799,19 +890,38 @@ def train_best_candidate(state: AutonomousState) -> dict[str, Any]:
         if not isinstance(best_params, dict) or not best_params:
             raise ValueError("No Optuna best parameters available")
 
-        model, holdout_pred, post = _fit_predict(train_df, holdout_df, features, best_params)
+        model, holdout_pred, post = _fit_predict(
+            train_df,
+            holdout_df,
+            features,
+            best_params,
+            gameweek_policy=gameweek_policy,
+            model_rules=model_rules,
+        )
+
+        position_caps = {}
+        if "position_id" in train_df.columns:
+            for position_id, group in train_df.groupby("position_id"):
+                position_caps[int(position_id)] = float(np.percentile(group["target_next_gw_points"], 95))
 
         snapshot_meta["candidate_model_payload"] = {
             "model": model,
             "metadata": {
                 "feature_cols": features,
                 "zscore_stats": snapshot_meta.get("global_stats", {}),
+                "position_caps": position_caps,
                 "league_mean": post["league_mean"],
                 "shrinkage_alpha": post["shrinkage_alpha"],
                 "calibration": post["calibration"],
+                "position_calibration": post.get("position_calibration"),
+                "calibration_report": post.get("calibration_report", {}),
+                "evaluation_window_summary": (post.get("backtest") or {}).get("summary", {}),
+                "trusted_gameweek_policy_version": gameweek_policy.get("policy_version"),
+                "use_log_target": post["use_log_target"],
             },
         }
         snapshot_meta["candidate_holdout_pred"] = holdout_pred
+        snapshot_meta["candidate_post"] = post
 
         _node_log(
             node="train_best_candidate",
@@ -841,6 +951,10 @@ def evaluate_candidate(state: AutonomousState) -> dict[str, Any]:
         train_df = snapshot_meta.get("train_df")
         features = snapshot_meta.get("features")
         holdout_pred = snapshot_meta.get("candidate_holdout_pred")
+        candidate_post = snapshot_meta.get("candidate_post") or {}
+        gameweek_policy = snapshot_meta.get("gameweek_policy") or {}
+        rules = _rules_from_state(state)
+        model_rules = dict(rules.get("model") or {})
 
         if not isinstance(holdout_df, pd.DataFrame) or not isinstance(train_df, pd.DataFrame):
             raise ValueError("Train/holdout frames missing for evaluation")
@@ -858,6 +972,21 @@ def evaluate_candidate(state: AutonomousState) -> dict[str, Any]:
             y_holdout=y_holdout,
             holdout_pred=holdout_pred_arr,
         )
+        candidate_backtest = candidate_post.get("backtest") or train_model.build_weekly_backtest_report(
+            holdout_df,
+            y_holdout.to_numpy(),
+            holdout_pred_arr,
+            gameweek_policy=gameweek_policy,
+            model_rules=model_rules,
+        )
+        candidate_summary = dict(candidate_backtest.get("summary") or {})
+        candidate_summary["mae"] = float(mean_absolute_error(y_holdout, holdout_pred_arr))
+        candidate_score = _balanced_candidate_score(candidate_summary)
+
+        _ensure_dirs()
+        weekly_report_path = AUTONOMOUS_LOG_DIR / f"{run_id}.weekly_report.json"
+        with weekly_report_path.open("w", encoding="utf-8") as handle:
+            json.dump(candidate_backtest, handle, indent=2, sort_keys=True)
 
         candidate_metrics = {
             "mae": float(mean_absolute_error(y_holdout, holdout_pred_arr)),
@@ -866,12 +995,21 @@ def evaluate_candidate(state: AutonomousState) -> dict[str, Any]:
             "position_exceed_rate": float(candidate_sanity.get("position_exceed_rate") or 0.0),
             "player_exceed_rate": float(candidate_sanity.get("player_exceed_rate") or 0.0),
             "sanity": candidate_sanity,
+            "backtest": candidate_backtest,
+            "backtest_summary": candidate_backtest.get("summary", {}),
+            "backtest_per_position": candidate_backtest.get("per_position", []),
+            "candidate_score": float(candidate_score),
+            "weekly_report_path": str(weekly_report_path),
+            "calibration_comparison": candidate_post.get("calibration_comparison", {}),
+            "calibration_report": candidate_post.get("calibration_report", {}),
         }
 
         active_baseline = {
             "mae": float("inf"),
             "rmse": float("inf"),
             "bias": 0.0,
+            "summary": {},
+            "backtest": {},
         }
         active_model_version = None
         active = get_active_model(DEFAULT_LOGS_DIR)
@@ -879,7 +1017,18 @@ def evaluate_candidate(state: AutonomousState) -> dict[str, Any]:
             active_model_version = active["version"]
             with Path(active["path"]).open("rb") as handle:
                 active_payload = pickle.load(handle)
-            active_baseline = _evaluate_payload(active_payload, holdout_df, features)
+            active_baseline = _evaluate_payload(
+                active_payload,
+                holdout_df,
+                features,
+                gameweek_policy=gameweek_policy,
+                model_rules=model_rules,
+            )
+            active_summary = dict(active_baseline.get("summary") or {})
+            active_summary["mae"] = float(active_baseline.get("mae", float("inf")))
+            active_baseline["candidate_score"] = _balanced_candidate_score(active_summary)
+        else:
+            active_baseline["candidate_score"] = float("inf")
 
         combined = {
             "candidate": candidate_metrics,
@@ -924,9 +1073,26 @@ def apply_domain_rules(state: AutonomousState) -> dict[str, Any]:
         candidate_bias = float(candidate.get("bias", 0.0))
         position_exceed_rate = float(candidate.get("position_exceed_rate", 0.0))
         player_exceed_rate = float(candidate.get("player_exceed_rate", 0.0))
+        candidate_summary = candidate.get("backtest_summary") or {}
+        calibration_comparison = candidate.get("calibration_comparison") or {}
+        candidate_score = float(candidate.get("candidate_score", float("inf")))
+
+        per_week_rows = (candidate.get("backtest") or {}).get("per_week") or []
+        prediction_ratios = [
+            float(row.get("prediction_to_actual_ratio", 1.0))
+            for row in per_week_rows
+            if row.get("prediction_to_actual_ratio") is not None
+        ]
+        if not prediction_ratios:
+            prediction_ratios = [1.0]
 
         active_mae = float(baseline.get("mae", float("inf")))
         active_rmse = float(baseline.get("rmse", float("inf")))
+        active_score = float(baseline.get("candidate_score", float("inf")))
+
+        position_calibration_gain = float(calibration_comparison.get("position_calibration_gain") or 0.0)
+        if not np.isfinite(position_calibration_gain):
+            position_calibration_gain = 0.0
 
         gates = {
             "drift_context_present": bool(drift_report.get("drift_triggered") is True),
@@ -935,7 +1101,28 @@ def apply_domain_rules(state: AutonomousState) -> dict[str, Any]:
             "max_abs_bias": abs(candidate_bias) <= float(model_rules["max_abs_bias"]),
             "position_exceed_cap": position_exceed_rate <= float(model_rules["max_position_exceed_rate"]),
             "player_exceed_cap": player_exceed_rate <= float(model_rules["max_player_exceed_rate"]),
+            "max_squad_total_bias": float(candidate_summary.get("squad_total_bias_abs_mean", 0.0))
+            <= float(model_rules["max_squad_total_bias"]),
+            "max_position_bias": float(candidate_summary.get("max_position_bias_abs", 0.0))
+            <= float(model_rules["max_position_bias"]),
+            "min_top_k_hit_rate": float(candidate_summary.get("top_k_hit_rate_mean", 0.0))
+            >= float(model_rules["min_top_k_hit_rate"]),
+            "min_rank_correlation": float(candidate_summary.get("rank_correlation_mean", 0.0))
+            >= float(model_rules["min_rank_correlation"]),
+            "max_selected_xi_regret": float(candidate_summary.get("selected_xi_regret_mean", 0.0))
+            <= float(model_rules["max_selected_xi_regret"]),
+            "max_prediction_collapse_weeks": int(candidate_summary.get("prediction_collapse_weeks", 0))
+            <= int(model_rules["max_prediction_collapse_weeks"]),
+            "max_bias_flip_weeks": int(candidate_summary.get("bias_flip_weeks", 0))
+            <= int(model_rules["max_bias_flip_weeks"]),
+            "prediction_ratio_min": min(prediction_ratios)
+            >= float(model_rules["min_prediction_to_actual_ratio"]),
+            "prediction_ratio_max": max(prediction_ratios)
+            <= float(model_rules["max_prediction_to_actual_ratio"]),
+            "position_calibration_gain": position_calibration_gain
+            >= float(model_rules["min_position_calibration_gain"]),
             "mae_improves_active": candidate_mae < active_mae,
+            "balanced_score_improves_active": candidate_score < active_score,
             "rmse_within_deterioration": (
                 True
                 if not np.isfinite(active_rmse)

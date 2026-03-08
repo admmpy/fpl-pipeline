@@ -17,6 +17,9 @@ from scripts.train_model import (
     apply_calibration as train_apply_calibration,
     compute_global_stats,
     FEATURES_TO_SCALE,
+    engineer_features,
+    select_calibration_variant,
+    select_features,
 )
 from tasks.ml_tasks import (
     apply_shrinkage as infer_apply_shrinkage,
@@ -25,6 +28,11 @@ from tasks.ml_tasks import (
     ensure_z_score_columns,
     run_ml_inference,
 )
+
+
+class _DummyPredictModel:
+    def predict(self, frame):
+        return np.full(len(frame), 1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -149,6 +157,65 @@ class TestApplyCalibration:
         np.testing.assert_array_almost_equal(train_result, infer_result)
 
 
+class TestFeatureEngineeringGuards:
+    def test_drops_terminal_rows_before_fill(self):
+        df = pd.DataFrame(
+            {
+                "player_id": [1, 1, 2, 2],
+                "gameweek_id": [1, 2, 1, 2],
+                "position_id": [2, 2, 3, 3],
+                "minutes_played": [90.0, 90.0, 90.0, 90.0],
+                "total_points": [5.0, 4.0, 3.0, 2.0],
+                "ict_index": [1.0, 1.0, 1.0, 1.0],
+            }
+        )
+        engineered = engineer_features(df)
+        assert len(engineered) == 2
+        assert (engineered["target_gameweek_id"] > engineered["gameweek_id"]).all()
+        assert (engineered["target_gameweek_id"] > 0).all()
+
+    def test_form_removed_from_feature_selection(self):
+        assert "form" not in select_features()
+
+    def test_collapses_double_gameweek_rows_before_target_shift(self):
+        df = pd.DataFrame(
+            {
+                "player_id": [1, 1, 1],
+                "gameweek_id": [26, 26, 27],
+                "fixture_id": [100, 101, 102],
+                "position_id": [1, 1, 1],
+                "minutes_played": [90.0, 90.0, 90.0],
+                "total_points": [1.0, 2.0, 4.0],
+                "ict_index": [0.0, 2.0, 3.0],
+            }
+        )
+        engineered = engineer_features(df)
+        assert len(engineered) == 1
+        assert engineered.iloc[0]["gameweek_id"] == 26
+        assert engineered.iloc[0]["target_gameweek_id"] == 27
+        assert engineered.iloc[0]["target_next_gw_points"] == pytest.approx(4.0)
+        assert engineered.iloc[0]["total_points"] == pytest.approx(3.0)
+
+
+class TestCalibrationSelection:
+    def test_prefers_none_when_calibration_worsens_metrics(self):
+        y_train = np.array([1.0, 2.0, 3.0, 4.0])
+        train_pred = np.array([1.0, 2.0, 3.0, 4.0])
+        y_holdout = np.array([1.0, 2.0, 3.0, 4.0])
+        holdout_pred = np.array([1.0, 2.0, 3.0, 4.0])
+
+        result = select_calibration_variant(
+            y_train=y_train,
+            train_pred=train_pred,
+            y_holdout=y_holdout,
+            holdout_pred=holdout_pred,
+            strength=1.0,
+        )
+
+        assert result["selected_variant"] == "none"
+        np.testing.assert_array_equal(result["selected_pred"], holdout_pred)
+
+
 # ---------------------------------------------------------------------------
 # apply_global_z_scores (tasks/ml_tasks.py)
 # ---------------------------------------------------------------------------
@@ -255,6 +322,37 @@ class TestRunMlInferenceFallback:
         predictions = run_ml_inference.fn(df, model_path="does-not-exist.bin")
         assert len(predictions) == 1
         assert predictions[0]["expected_points_next_gw"] == pytest.approx(3.0 * 0.7 + 2.0)
+
+
+class TestRunMlInferencePublicationGuard:
+    def test_invalid_model_blocks_forward_predictions(self, tmp_path):
+        payload = {
+            "model": _DummyPredictModel(),
+            "metadata": {
+                "feature_cols": ["total_points"],
+                "forward_publish_ready": False,
+                "forward_publish_reasons": ["max_prediction_collapse_weeks"],
+            },
+        }
+        model_path = tmp_path / "model.bin"
+        with model_path.open("wb") as handle:
+            import pickle
+
+            pickle.dump(payload, handle)
+
+        df = pd.DataFrame(
+            {
+                "gameweek_id": [10],
+                "player_id": [1],
+                "web_name": ["A"],
+                "position_id": [2],
+                "team_id": [1],
+                "now_cost": [5.0],
+                "total_points": [10.0],
+            }
+        )
+        predictions = run_ml_inference.fn(df, model_path=str(model_path))
+        assert predictions == []
 
 
 # ---------------------------------------------------------------------------

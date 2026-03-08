@@ -26,6 +26,7 @@ from config import TABLE_SCHEMAS
 from scripts import train_model
 from tasks.ml_tasks import fetch_training_data, ensure_z_score_columns
 from tasks.optimizer_tasks import optimize_squad_task, add_recommendation_metadata
+from utils.gameweek_quality import load_gameweek_quality_policy
 from utils.snowflake_client import create_typed_table, get_snowflake_connection, insert_typed_records
 
 LOGGER = logging.getLogger(__name__)
@@ -62,7 +63,47 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional prefix for recommended_at timestamps.",
     )
+    parser.add_argument(
+        "--rules-path",
+        type=str,
+        default="config/domain_rules.yaml",
+        help="Domain rules path used for trust policy version metadata.",
+    )
     return parser.parse_args()
+
+
+def validate_backfill_integrity(
+    *,
+    train_df: pd.DataFrame,
+    feature_df: pd.DataFrame,
+    target_gw: int,
+    validation_version: str,
+) -> Dict[str, Any]:
+    """Validate rebuilt week uses only prior data and is trust-eligible."""
+
+    train_max_target = int(train_df["target_gameweek_id"].max()) if "target_gameweek_id" in train_df.columns else -1
+    inference_source_max = int(feature_df[feature_df["gameweek_id"] <= (target_gw - 1)]["gameweek_id"].max())
+    train_prior_only = bool(train_max_target < target_gw)
+    inference_prior_only = bool(inference_source_max <= (target_gw - 1))
+    trusted = bool(train_prior_only and inference_prior_only)
+
+    status = "validated_trusted" if trusted else "failed_contaminated"
+    details = (
+        f"train_max_target_gw={train_max_target};"
+        f"inference_max_source_gw={inference_source_max};"
+        f"target_gw={target_gw};"
+        f"train_prior_only={train_prior_only};"
+        f"inference_prior_only={inference_prior_only}"
+    )
+    return {
+        "trusted": trusted,
+        "status": status,
+        "details": details,
+        "validation_version": validation_version,
+        "validated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+        "train_max_target_gameweek": train_max_target,
+        "inference_max_source_gameweek": inference_source_max,
+    }
 
 
 def _add_minutes_band_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -105,12 +146,24 @@ def _prepare_training_data(feature_df: pd.DataFrame, target_gw: int) -> tuple[pd
 def _train_point_in_time_model(
     train_df: pd.DataFrame,
     feature_cols: List[str],
-) -> tuple[Any, float]:
+) -> tuple[Any, dict[str, Any]]:
     X_train = train_df[feature_cols]
     y_train = train_df["target_next_gw_points"]
     model = train_model.train_xgboost_model(X_train, y_train)
-    league_mean = float(y_train.mean())
-    return model, league_mean
+    position_caps = {}
+    if "position_id" in train_df.columns:
+        for position_id, group in train_df.groupby("position_id"):
+            position_caps[int(position_id)] = float(np.percentile(group["target_next_gw_points"], 95))
+    metadata = {
+        "league_mean": float(y_train.mean()),
+        "shrinkage_alpha": float(train_model.SHRINKAGE_ALPHA),
+        "selected_calibration_variant": "none",
+        "calibration": None,
+        "position_calibration": None,
+        "position_caps": position_caps,
+        "use_log_target": bool(train_model.LOG_TARGET),
+    }
+    return model, metadata
 
 
 def _build_predictions_for_target_gw(
@@ -119,7 +172,7 @@ def _build_predictions_for_target_gw(
     model: Any,
     feature_cols: List[str],
     zscore_stats: Dict[str, Dict[str, float]],
-    league_mean: float,
+    metadata: dict[str, Any],
 ) -> List[Dict[str, Any]]:
     inference_df = feature_df[feature_df["gameweek_id"] <= (target_gw - 1)].copy()
     if inference_df.empty:
@@ -145,10 +198,18 @@ def _build_predictions_for_target_gw(
 
     X_inference = latest_stats[feature_cols].fillna(0)
     preds = model.predict(X_inference)
-    if train_model.LOG_TARGET:
+    if bool(metadata.get("use_log_target", False)):
         preds = train_model._inverse_transform(preds)  # Existing helper from training module
-    preds = train_model.apply_shrinkage(preds, league_mean, train_model.SHRINKAGE_ALPHA)
-    preds = np.maximum(preds, 0)
+    preds = train_model.apply_prediction_post_processing(
+        preds,
+        league_mean=metadata.get("league_mean"),
+        shrinkage_alpha=float(metadata.get("shrinkage_alpha", 0.0)),
+        calibration=metadata.get("calibration"),
+        position_calibration=metadata.get("position_calibration"),
+        selected_variant=str(metadata.get("selected_calibration_variant", "none")),
+        position_ids=latest_stats["position_id"].to_numpy() if "position_id" in latest_stats.columns else None,
+        position_caps=metadata.get("position_caps"),
+    )
 
     latest_stats["expected_points_next_gw"] = preds
     predictions: List[Dict[str, Any]] = []
@@ -174,6 +235,27 @@ def _ensure_table_and_marker_column() -> None:
         cursor.execute(
             "ALTER TABLE recommended_squad ADD COLUMN IF NOT EXISTS backfill_method VARCHAR(100)"
         )
+        cursor.execute(
+            "ALTER TABLE recommended_squad ADD COLUMN IF NOT EXISTS backfill_trusted BOOLEAN"
+        )
+        cursor.execute(
+            "ALTER TABLE recommended_squad ADD COLUMN IF NOT EXISTS backfill_validation_status VARCHAR(50)"
+        )
+        cursor.execute(
+            "ALTER TABLE recommended_squad ADD COLUMN IF NOT EXISTS backfill_validation_details VARCHAR(500)"
+        )
+        cursor.execute(
+            "ALTER TABLE recommended_squad ADD COLUMN IF NOT EXISTS backfill_validation_version VARCHAR(50)"
+        )
+        cursor.execute(
+            "ALTER TABLE recommended_squad ADD COLUMN IF NOT EXISTS backfill_validated_at TIMESTAMP_NTZ"
+        )
+        cursor.execute(
+            "ALTER TABLE recommended_squad ADD COLUMN IF NOT EXISTS backfill_train_max_target_gw INTEGER"
+        )
+        cursor.execute(
+            "ALTER TABLE recommended_squad ADD COLUMN IF NOT EXISTS backfill_inference_max_source_gw INTEGER"
+        )
         conn.commit()
         cursor.close()
 
@@ -192,17 +274,24 @@ def backfill_gameweek(
     target_gw: int,
     dry_run: bool,
     timestamp_prefix: str,
+    validation_version: str,
 ) -> Dict[str, Any]:
     LOGGER.info("Backfilling GW%s with point-in-time retraining...", target_gw)
     train_df, feature_cols, zscore_stats = _prepare_training_data(feature_df, target_gw)
-    model, league_mean = _train_point_in_time_model(train_df, feature_cols)
+    model, model_metadata = _train_point_in_time_model(train_df, feature_cols)
     predictions = _build_predictions_for_target_gw(
         feature_df=feature_df,
         target_gw=target_gw,
         model=model,
         feature_cols=feature_cols,
         zscore_stats=zscore_stats,
-        league_mean=league_mean,
+        metadata=model_metadata,
+    )
+    validation = validate_backfill_integrity(
+        train_df=train_df,
+        feature_df=feature_df,
+        target_gw=target_gw,
+        validation_version=validation_version,
     )
     squad = optimize_squad_task.fn(predictions)
 
@@ -212,6 +301,13 @@ def backfill_gameweek(
     for row in squad:
         row["gameweek_id"] = target_gw
         row["backfill_method"] = BACKFILL_METHOD
+        row["backfill_trusted"] = bool(validation["trusted"])
+        row["backfill_validation_status"] = validation["status"]
+        row["backfill_validation_details"] = validation["details"][:500]
+        row["backfill_validation_version"] = validation["validation_version"]
+        row["backfill_validated_at"] = validation["validated_at"]
+        row["backfill_train_max_target_gw"] = int(validation["train_max_target_gameweek"])
+        row["backfill_inference_max_source_gw"] = int(validation["inference_max_source_gameweek"])
 
     loaded = 0
     if not dry_run:
@@ -224,6 +320,11 @@ def backfill_gameweek(
         "squad_rows": int(len(squad)),
         "loaded_rows": int(loaded),
         "backfill_method": BACKFILL_METHOD,
+        "backfill_trusted": bool(validation["trusted"]),
+        "backfill_validation_status": validation["status"],
+        "backfill_validation_version": validation["validation_version"],
+        "backfill_train_max_target_gw": int(validation["train_max_target_gameweek"]),
+        "backfill_inference_max_source_gw": int(validation["inference_max_source_gameweek"]),
         "recommended_at": recommended_at,
         "dry_run": dry_run,
     }
@@ -234,6 +335,8 @@ def main() -> None:
     args = parse_args()
     target_gameweeks = sorted(set(args.gameweeks))
     timestamp_prefix = args.recommended_at_prefix or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    gameweek_policy = load_gameweek_quality_policy(args.rules_path)
+    validation_version = str(gameweek_policy.get("policy_version") or "unknown")
 
     LOGGER.info("Fetching feature data once from Snowflake...")
     feature_df = fetch_training_data.fn()
@@ -248,6 +351,7 @@ def main() -> None:
             target_gw=target_gw,
             dry_run=args.dry_run,
             timestamp_prefix=timestamp_prefix,
+            validation_version=validation_version,
         )
         results.append(result)
         LOGGER.info(

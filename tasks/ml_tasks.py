@@ -16,8 +16,13 @@ from utils.local_data import (
 )
 from config import get_snowflake_config
 import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
+import train_model
 
 DEFAULT_SHRINKAGE_ALPHA = 0.0
+ALLOW_INVALID_FORWARD_PUBLISH = os.getenv("ALLOW_INVALID_FORWARD_PUBLISH", "").lower() in {"1", "true", "yes"}
 
 
 def get_logger():
@@ -238,11 +243,18 @@ def run_ml_inference(df: pd.DataFrame, model_path: str = "logs/model.bin") -> Li
             'opponent_roll_avg_goals_conceded', 'opponent_roll_avg_xg',
             'opponent_defence_strength', 'team_attack_strength',
             'team_position', 'opponent_team_position', 'team_position_difference',
-            'form', 'now_cost',
+            'now_cost',
             'total_points_z_score', 'minutes_played_z_score', 'ict_index_z_score',
             'is_gk', 'is_def', 'is_mid', 'is_fwd'
         ]
         feature_cols = metadata.get('feature_cols') or default_feature_cols
+        if not bool(metadata.get("forward_publish_ready", True)) and not ALLOW_INVALID_FORWARD_PUBLISH:
+            logger.error(
+                "Active model is marked invalid for forward publication; refusing to emit predictions. "
+                "Reasons: %s",
+                metadata.get("forward_publish_reasons", []),
+            )
+            return []
         
         # Engineer additional features needed for inference
         # Position encoding
@@ -250,6 +262,18 @@ def run_ml_inference(df: pd.DataFrame, model_path: str = "logs/model.bin") -> Li
         df['is_def'] = (df['position_id'] == 2).astype(int)
         df['is_mid'] = (df['position_id'] == 3).astype(int)
         df['is_fwd'] = (df['position_id'] == 4).astype(int)
+
+        # Recreate minute-band one-hot features expected by tuned models.
+        if 'minutes_played' in df.columns:
+            minute_band = pd.cut(
+                df['minutes_played'].fillna(0),
+                bins=[-1, 30, 60, float('inf')],
+                labels=['0_30', '31_60', '61_90']
+            )
+            for label in ['0_30', '31_60', '61_90']:
+                col = f'minutes_band_{label}'
+                if col not in df.columns:
+                    df[col] = (minute_band == label).astype(int)
 
         # Apply global z-scores using training stats, if available
         zscore_features = ['total_points', 'minutes_played', 'ict_index']
@@ -281,37 +305,31 @@ def run_ml_inference(df: pd.DataFrame, model_path: str = "logs/model.bin") -> Li
         except Exception as exc:
             logger.error(f"model.predict() failed: {exc}")
             return []
-        predictions_array = np.maximum(predictions_array, 0)
+        if bool(metadata.get("use_log_target", False)):
+            predictions_array = train_model._inverse_transform(np.asarray(predictions_array))
 
         league_mean = metadata.get('league_mean')
         shrinkage_alpha = metadata.get('shrinkage_alpha', DEFAULT_SHRINKAGE_ALPHA)
         if league_mean is not None:
-            predictions_array = apply_shrinkage(predictions_array, league_mean, shrinkage_alpha)
             logger.info(f"Applied shrinkage: alpha={shrinkage_alpha}, league_mean={league_mean:.2f}")
-        
-        calibration = metadata.get('calibration')
-        if calibration:
-            predictions_array = apply_calibration(
-                predictions_array,
-                calibration.get('a', 1.0),
-                calibration.get('b', 0.0)
-            )
-            logger.info("Applied calibration to predictions.")
-        
-        # Clip negative predictions to zero after shrinkage/calibration
-        predictions_array = np.maximum(predictions_array, 0)
+
+        selected_variant = metadata.get("selected_calibration_variant", "none")
+        predictions_array = train_model.apply_prediction_post_processing(
+            np.asarray(predictions_array),
+            league_mean=league_mean,
+            shrinkage_alpha=shrinkage_alpha,
+            calibration=metadata.get('calibration'),
+            position_calibration=metadata.get("position_calibration"),
+            selected_variant=selected_variant,
+            position_ids=latest_stats["position_id"].to_numpy() if "position_id" in latest_stats.columns else None,
+            position_caps=metadata.get('position_caps', {}),
+        )
+        if selected_variant == "position_aware":
+            logger.info("Applied position-aware calibration to predictions.")
+        elif selected_variant == "global":
+            logger.info("Applied global calibration to predictions.")
 
         latest_stats['expected_points_next_gw'] = predictions_array
-
-        # Apply per-position caps if available
-        position_caps = metadata.get('position_caps', {})
-        if position_caps:
-            cap_values = latest_stats['position_id'].map(position_caps).fillna(np.inf).to_numpy()
-            before_clip = latest_stats['expected_points_next_gw'].to_numpy()
-            latest_stats['expected_points_next_gw'] = np.minimum(before_clip, cap_values)
-            clipped = (before_clip > cap_values).sum()
-            if clipped:
-                logger.info(f"Applied position caps: {clipped} predictions clipped")
         
         clipped_stats = latest_stats['expected_points_next_gw']
         logger.info(
