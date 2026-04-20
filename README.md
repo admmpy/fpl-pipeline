@@ -1,4 +1,4 @@
-# FPL Data Pipeline
+# FPL Data Pipeline (Decommissioned - SF Trial Finished)
 
 A Python pipeline for ingesting Fantasy Premier League data into Snowflake using Prefect orchestration.
 
